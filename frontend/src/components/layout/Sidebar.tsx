@@ -1,0 +1,765 @@
+import { useState } from 'react';
+import { NavLink } from 'react-router-dom';
+import { useRBAC } from '../../hooks/useRBAC';
+import { useAuth } from '../../hooks/useAuth';
+import { DepartmentLogo } from '../../components/branding/DepartmentBrand';
+import { useCurrentDepartment } from '../../components/branding/department';
+import { APP_NAME } from '../../utils/constants';
+import { getMediaUrl } from '../../api/client';
+import { cn } from '../../utils/cn';
+import {
+  LayoutDashboard,
+  BookOpen,
+  CreditCard,
+  FileSignature,
+  HelpCircle,
+  Calendar,
+  User,
+  BookMarked,
+  Users,
+  ShieldAlert,
+  Settings,
+  DollarSign,
+  TrendingUp,
+  ChevronLeft,
+  ChevronDown,
+  LogOut,
+  X,
+  BarChart3,
+  Clock,
+  Megaphone,
+  Wrench,
+  Bell,
+  FileClock,
+  GraduationCap,
+  MessagesSquare,
+  Wallet,
+  ChartColumn,
+  UsersRound,
+  Medal,
+  Coins,
+} from 'lucide-react';
+import type { UserRole } from '../../types';
+
+interface SidebarProps {
+  collapsed: boolean;
+  onToggleCollapse: () => void;
+  mobileOpen: boolean;
+  onMobileClose: () => void;
+}
+
+interface MenuItem {
+  label: string;
+  path: string;
+  icon: React.ComponentType<{ className?: string }>;
+  roles?: UserRole[];
+}
+
+interface NavSection {
+  title: string;
+  icon: React.ComponentType<{ className?: string }>;
+  key: string;
+  items: (MenuItem & { icon: React.ComponentType<{ className?: string }> })[];
+  locked?: boolean;
+  lockMessage?: string;
+  roles?: UserRole[];
+}
+
+const menuItems: MenuItem[] = [
+  {
+    label: 'Dashboard',
+    path: '/dashboard',
+    icon: LayoutDashboard,
+    roles: [
+      'student',
+      'lecturer',
+      'class_rep',
+      'class_bursar',
+      'dept_bursar',
+      'alumni',
+      'project_coordinator',
+      'event_coordinator',
+      'alumni_rep',
+    ],
+  },
+
+  {
+    label: 'Communication',
+    path: '/communication',
+    icon: Bell,
+    roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+  },
+
+  // {
+  //   label: 'My Results',
+  //   path: '/results',
+  //   icon: Award,
+  //   roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+  // },
+  {
+    label: 'GPA Tools',
+    path: '/gpa',
+    icon: TrendingUp,
+    roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+  },
+  // {
+  //   label: 'Study Planner',
+  //   path: '/study-planner',
+  //   icon: ClipboardList,
+  //   roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+  // },
+  {
+    label: 'Courses Registration',
+    path: '/courses',
+    icon: BookMarked,
+    roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+  },
+  // {
+  //   label: 'My Attendance',
+  //   path: '/attendance',
+  //   icon: ClipboardCheck,
+  //   roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+  // },
+  {
+    label: 'Complaints',
+    path: '/complaints',
+    icon: HelpCircle,
+    roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+  },
+  // {
+  //   label: 'Notice Board',
+  //   path: '/notice-board',
+  //   icon: Pin,
+  //   roles: ['student', 'lecturer', 'class_rep', 'class_bursar', 'dept_bursar', 'alumni', 'hod', 'delegated_admin'],
+  // },
+
+  {
+    label: 'Payments & Dues',
+    path: '/payments',
+    icon: CreditCard,
+    roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+  },
+  {
+    label: 'Course Form Signing',
+    path: '/course-form-signing',
+    icon: FileSignature,
+    roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+  },
+
+  { label: 'Connect', path: '/connect', icon: Users },
+  // { label: 'Skills & Trade', path: '/skills', icon: TrendingUp },
+
+  // {
+  //   label: 'Alumni Portal',
+  //   path: '/alumni',
+  //   icon: GraduationCap,
+  //   roles: ['student', 'alumni', 'hod', 'delegated_admin'],
+  // },
+  // { label: 'Job Board', path: '/alumni/jobs', icon: Briefcase, roles: ['alumni', 'hod', 'delegated_admin'] },
+  // {
+  //   label: 'Mentorship Requests',
+  //   path: '/alumni/mentorship',
+  //   icon: Users,
+  //   roles: ['alumni', 'hod', 'delegated_admin'],
+  // },
+  // { label: 'Give Back', path: '/alumni/give-back', icon: DollarSign, roles: ['alumni', 'hod', 'delegated_admin'] },
+
+  { label: 'Lecturer Portal', path: '/lecturer', icon: LayoutDashboard, roles: ['lecturer'] },
+  // { label: 'Grade Entry', path: '/lecturer/scores', icon: ClipboardList, roles: ['lecturer'] },
+  // { label: 'Manage Assignments', path: '/lecturer/assignments', icon: ListTodo, roles: ['lecturer'] },
+  { label: 'Class List', path: '/lecturer/class-list', icon: Users, roles: ['lecturer'] },
+  // { label: 'Review Attendance', path: '/lecturer/attendance-review', icon: ClipboardCheck, roles: ['lecturer'] },
+  // { label: 'Course Materials', path: '/lecturer/materials', icon: FolderOpen, roles: ['lecturer'] },
+  // { label: 'Leave Requests', path: '/lecturer/leave', icon: FileClock, roles: ['lecturer'] },
+
+  { label: 'Class Rep Portal', path: '/class-rep', icon: LayoutDashboard, roles: ['class_rep'] },
+  // { label: 'Track Attendance', path: '/class-rep/attendance', icon: ClipboardList, roles: ['class_rep'] },
+  { label: 'Pending Registrations', path: '/class-rep/pending', icon: ShieldAlert, roles: ['class_rep'] },
+  { label: 'Class List', path: '/class-rep/class-list', icon: Users, roles: ['class_rep'] },
+  { label: 'Notify Classmates', path: '/class-rep/notify', icon: Megaphone, roles: ['class_rep'] },
+
+  { label: 'Bursar Portal', path: '/bursar', icon: LayoutDashboard, roles: ['class_bursar', 'dept_bursar'] },
+  {
+    label: 'Dues Management',
+    path: '/bursar/dues',
+    icon: DollarSign,
+    roles: ['class_bursar', 'dept_bursar', 'hod', 'delegated_admin'],
+  },
+  { label: 'Verify Payments', path: '/bursar/verify', icon: DollarSign, roles: ['class_bursar', 'dept_bursar'] },
+  { label: 'Defaulters List', path: '/bursar/defaulters', icon: ShieldAlert, roles: ['class_bursar', 'dept_bursar'] },
+  { label: 'Payment History', path: '/bursar/history', icon: Clock, roles: ['class_bursar', 'dept_bursar'] },
+
+  { label: 'Admin Portal', path: '/admin', icon: LayoutDashboard, roles: ['hod', 'delegated_admin', 'admin'] },
+  // {
+  //   label: 'Results Management',
+  //   path: '/admin/results/manage',
+  //   icon: ClipboardList,
+  //   roles: ['hod', 'delegated_admin', 'admin'],
+  // },
+  { label: 'User Directory', path: '/admin/users', icon: Users, roles: ['hod', 'delegated_admin', 'admin'] },
+  {
+    label: 'Lecturer Management',
+    path: '/admin/lecturers',
+    icon: FileClock,
+    roles: ['hod', 'delegated_admin', 'admin'],
+  },
+  {
+    label: 'User Roles and Permissions',
+    path: '/admin/user-roles',
+    icon: ShieldAlert,
+    roles: ['hod', 'delegated_admin', 'admin'],
+  },
+  { label: 'Analytics', path: '/admin/analytics', icon: BarChart3, roles: ['hod', 'delegated_admin', 'admin'] },
+  {
+    label: 'Revenue Forecast',
+    path: '/admin/revenue-forecast',
+    icon: TrendingUp,
+    roles: ['hod', 'delegated_admin', 'admin'],
+  },
+  { label: 'Course Hub', path: '/admin/course-hub', icon: BookOpen, roles: ['hod', 'delegated_admin', 'admin'] },
+  { label: 'Sessions', path: '/admin/sessions', icon: Calendar, roles: ['hod', 'delegated_admin', 'admin'] },
+  { label: 'Announcements', path: '/admin/announcements', icon: Megaphone, roles: ['hod', 'delegated_admin', 'admin'] },
+  // { label: 'Academics', path: '/admin/academics', icon: GraduationCap, roles: ['hod', 'delegated_admin', 'admin'] },
+  // { label: 'Complaints', path: '/admin/complaints', icon: HelpCircle, roles: ['hod', 'delegated_admin', 'admin'] },
+  // { label: 'Alumni Mgmt', path: '/admin/alumni', icon: GraduationCap, roles: ['hod', 'delegated_admin', 'admin'] },
+  // {
+  //   label: 'Job Moderation',
+  //   path: '/admin/job-moderation',
+  //   icon: Briefcase,
+  //   roles: ['hod', 'delegated_admin', 'admin'],
+  // },
+  { label: 'At-Risk Students', path: '/admin/at-risk', icon: ShieldAlert, roles: ['hod', 'delegated_admin', 'admin'] },
+  {
+    label: 'CRF Signatures',
+    path: '/admin/crf-signing',
+    icon: FileSignature,
+    roles: ['hod', 'delegated_admin', 'admin'],
+  },
+  // { label: 'Expenses', path: '/admin/expenses', icon: DollarSign, roles: ['hod', 'delegated_admin', 'admin'] },
+  { label: 'Operations and Issues', path: '/admin/system', icon: Wrench, roles: ['hod', 'delegated_admin', 'admin'] },
+  { label: 'Settings', path: '/admin/settings', icon: Settings, roles: ['hod', 'delegated_admin', 'admin'] },
+
+  // { label: 'AI Blueprint', path: '/ai-blueprint', icon: Brain, roles: ['hod', 'delegated_admin', 'admin'] },
+
+  { label: 'Profile', path: '/profile', icon: User },
+];
+
+const mobileSections: NavSection[] = [
+  {
+    title: 'ACADEMICS',
+    icon: GraduationCap,
+    key: 'academics',
+    roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+    items: [
+      // { label: 'My Results', path: '/results', icon: Award },
+      { label: 'GPA Tools', path: '/gpa', icon: TrendingUp },
+      // { label: 'Study Planner', path: '/study-planner', icon: ClipboardList },
+      { label: 'Courses Registration', path: '/courses', icon: BookMarked },
+      { label: 'Course Form Signing', path: '/course-form-signing', icon: FileSignature },
+      // { label: 'My Attendance', path: '/attendance', icon: ClipboardCheck },
+      { label: 'Complaints', path: '/complaints', icon: HelpCircle },
+    ],
+  },
+  {
+    title: 'COMMUNITY',
+    icon: MessagesSquare,
+    key: 'community',
+    items: [
+      { label: 'Connect', path: '/connect', icon: Users },
+      { label: 'Communication', path: '/communication', icon: Bell },
+      // { label: 'Find a Mentor', path: '/find-mentor', icon: GraduationCap },
+
+      // { label: 'Notice Board', path: '/notice-board', icon: Pin },
+    ],
+  },
+  {
+    title: 'FINANCE',
+    icon: Wallet,
+    key: 'finance',
+    roles: ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'],
+    items: [{ label: 'Payments & Dues', path: '/payments', icon: CreditCard }],
+  },
+  // {
+  //   title: 'ALUMNI',
+  //   icon: '\u{1F393}',
+  //   key: 'alumni',
+  //   locked: true,
+  //   lockMessage: 'Available for graduates (Year 5+)',
+  //   items: [{ label: 'Alumni Portal', path: '/alumni', icon: GraduationCap }],
+  // },
+  {
+    title: 'OVERVIEW',
+    icon: ChartColumn,
+    key: 'admin_overview',
+    roles: ['hod', 'delegated_admin', 'admin'],
+    items: [
+      { label: 'Admin Portal', path: '/admin', icon: LayoutDashboard },
+      // { label: 'Analytics', path: '/admin/analytics', icon: BarChart3 },
+      { label: 'Revenue Forecast', path: '/admin/revenue-forecast', icon: TrendingUp },
+      // { label: 'At-Risk Students', path: '/admin/at-risk', icon: ShieldAlert },
+    ],
+  },
+  {
+    title: 'ACADEMICS',
+    icon: GraduationCap,
+    key: 'admin_academics',
+    roles: ['hod', 'delegated_admin', 'admin'],
+    items: [
+      // { label: 'Academics', path: '/admin/academics', icon: GraduationCap },
+      { label: 'Sessions', path: '/admin/sessions', icon: Calendar },
+      { label: 'Course Hub', path: '/admin/course-hub', icon: BookOpen },
+      // { label: 'Results Management', path: '/admin/results/manage', icon: ClipboardList },
+      { label: 'CRF Signatures', path: '/admin/crf-signing', icon: FileSignature },
+    ],
+  },
+  {
+    title: 'USERS & ROLES',
+    icon: UsersRound,
+    key: 'admin_users',
+    roles: ['hod', 'delegated_admin', 'admin'],
+    items: [
+      { label: 'User Directory', path: '/admin/users', icon: Users },
+      // { label: 'Lecturer Management', path: '/admin/lecturers', icon: FileClock },
+      { label: 'User Roles and Permissions', path: '/admin/user-roles', icon: ShieldAlert },
+    ],
+  },
+  {
+    title: 'FINANCE',
+    icon: Wallet,
+    key: 'admin_finance',
+    roles: ['hod', 'delegated_admin', 'admin'],
+    items: [{ label: 'Dues Management', path: '/bursar/dues', icon: DollarSign }],
+  },
+  // {
+  //   title: 'ALUMNI',
+  //   icon: '\u{1F393}',
+  //   key: 'admin_alumni',
+  //   roles: ['hod', 'delegated_admin', 'admin'],
+  //   items: [
+  //     { label: 'Alumni Portal', path: '/alumni', icon: GraduationCap },
+  //     { label: 'Job Board', path: '/alumni/jobs', icon: Briefcase },
+  //     { label: 'Job Moderation', path: '/admin/job-moderation', icon: Briefcase },
+  //     { label: 'Mentorship Requests', path: '/alumni/mentorship', icon: Users },
+  //     { label: 'Give Back', path: '/alumni/give-back', icon: DollarSign },
+  //     { label: 'Alumni Mgmt', path: '/admin/alumni', icon: GraduationCap },
+  //   ],
+  // },
+  {
+    title: 'COMMUNICATIONS',
+    icon: Megaphone,
+    key: 'admin_comms',
+    roles: ['hod', 'delegated_admin', 'admin'],
+    items: [{ label: 'Announcements', path: '/admin/announcements', icon: Megaphone }],
+  },
+  {
+    title: 'SYSTEM',
+    icon: Settings,
+    key: 'system',
+    roles: ['hod', 'delegated_admin', 'admin'],
+    items: [
+      { label: 'Operations and Issues', path: '/admin/system', icon: Wrench },
+      { label: 'Settings', path: '/admin/settings', icon: Settings },
+    ],
+  },
+  {
+    title: 'CLASS REP',
+    icon: Medal,
+    key: 'class_rep',
+    roles: ['class_rep'],
+    items: [
+      { label: 'Class Rep Portal', path: '/class-rep', icon: LayoutDashboard },
+      // { label: 'Track Attendance', path: '/class-rep/attendance', icon: ClipboardList },
+      { label: 'Pending Registrations', path: '/class-rep/pending', icon: ShieldAlert },
+      { label: 'Class List', path: '/class-rep/class-list', icon: Users },
+      { label: 'Notify Classmates', path: '/class-rep/notify', icon: Megaphone },
+    ],
+  },
+  {
+    title: 'BURSAR',
+    icon: Coins,
+    key: 'bursar',
+    roles: ['class_bursar', 'dept_bursar'],
+    items: [
+      { label: 'Bursar Portal', path: '/bursar', icon: LayoutDashboard },
+      { label: 'Dues Management', path: '/bursar/dues', icon: DollarSign },
+      { label: 'Verify Payments', path: '/bursar/verify', icon: DollarSign },
+      { label: 'Defaulters List', path: '/bursar/defaulters', icon: ShieldAlert },
+      { label: 'Payment History', path: '/bursar/history', icon: Clock },
+    ],
+  },
+];
+
+const Sidebar = ({ collapsed, onToggleCollapse, mobileOpen, onMobileClose }: SidebarProps) => {
+  const { activeRole } = useRBAC();
+  const { user, logout } = useAuth();
+  const department = useCurrentDepartment();
+  const [expandedSections, setExpandedSections] = useState<string[]>(['academics', 'admin_overview']);
+
+  const isPendingApproval =
+    user &&
+    user.onboardingCompleted !== false &&
+    user.isApproved === false &&
+    user.isActive !== false &&
+    ['student', 'lecturer'].includes(activeRole || '');
+
+  const toggleSection = (key: string) => {
+    setExpandedSections((prev) => (prev.includes(key) ? prev.filter((s) => s !== key) : [...prev, key]));
+  };
+
+  const filteredItems = menuItems.filter((item) => {
+    if (!item.roles) return true;
+    return item.roles.includes(activeRole);
+  });
+
+  const isAlumni = user?.roles.includes('alumni');
+
+  // Desktop grouping — only Student and Admin currently have enough items to
+  // warrant sections; other roles (lecturer, class_rep, bursar) keep the
+  // plain flat list below.
+  const isStudentLike = ['student', 'project_coordinator', 'event_coordinator', 'alumni_rep'].includes(activeRole);
+  const isAdminLike = ['hod', 'delegated_admin', 'admin'].includes(activeRole);
+  const desktopSections = isStudentLike
+    ? mobileSections.filter((s) => ['academics', 'community', 'finance', 'alumni'].includes(s.key))
+    : isAdminLike
+      ? mobileSections.filter((s) => s.key.startsWith('admin_') || s.key === 'system')
+      : null;
+  const dashboardItem = menuItems.find((i) => i.path === '/dashboard')!;
+  const profileItem = menuItems.find((i) => i.path === '/profile')!;
+
+  const renderDesktopItem = (item: MenuItem) => {
+    const Icon = item.icon;
+    return (
+      <NavLink
+        key={item.path}
+        to={item.path}
+        className={({ isActive }) =>
+          cn(
+            'flex items-center justify-center mx-1.5 p-2.5 rounded-xl transition-all duration-150',
+            !collapsed && 'md:gap-3 md:px-3 md:py-2.5 md:mx-2 md:text-sm md:font-medium md:justify-start',
+            isActive
+              ? 'bg-primary-50 text-primary-600 dark:bg-primary-950/20 dark:text-primary-400'
+              : 'text-surface-600 dark:text-surface-400 hover:bg-surface-50 dark:hover:bg-surface-800 hover:text-surface-900 dark:hover:text-surface-100',
+          )
+        }
+        title={item.label}
+      >
+        <Icon className="w-5 h-5 shrink-0" />
+        {!collapsed && <span className="hidden md:inline">{item.label}</span>}
+      </NavLink>
+    );
+  };
+
+  const renderDesktopSection = (section: NavSection) => {
+    const showLocked = section.locked && !isAlumni;
+    return (
+      <div key={section.key} className="mt-4 first:mt-0">
+        {!collapsed ? (
+          <p className="hidden md:block px-5 mb-1.5 text-[11px] font-semibold uppercase tracking-widest text-surface-400 dark:text-surface-600">
+            {section.title}
+          </p>
+        ) : (
+          <div className="mx-4 my-2 border-t border-surface-200 dark:border-surface-800" />
+        )}
+        {showLocked
+          ? !collapsed && (
+              <p className="hidden md:block px-5 py-1 text-xs text-surface-400 dark:text-surface-500 italic">
+                {section.lockMessage}
+              </p>
+            )
+          : section.items.map((item) => renderDesktopItem(item))}
+      </div>
+    );
+  };
+
+  return (
+    <>
+      {/* ─── Mobile overlay backdrop ─── */}
+      <div
+        className={cn(
+          'fixed inset-0 z-40 bg-black/40 backdrop-blur-sm md:hidden transition-opacity duration-200',
+          mobileOpen ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none',
+        )}
+        onClick={onMobileClose}
+      />
+
+      {/* ─── Mobile drawer ─── */}
+      <aside
+        className={cn(
+          'fixed top-0 left-0 bottom-0 z-50 w-80 bg-white dark:bg-surface-900 shadow-2xl md:hidden flex flex-col transition-transform duration-300 ease-out',
+          mobileOpen ? 'translate-x-0' : '-translate-x-full',
+        )}
+      >
+        {/* Mobile header */}
+        <div className="flex items-center justify-between min-h-[4rem] py-3 px-4 border-b border-surface-200 dark:border-surface-800">
+          <div className="flex items-center gap-2 min-w-0">
+            <DepartmentLogo department={department} className="w-8 h-8 shadow-md" />
+            <div className="min-w-0">
+              <p className="font-bold text-base leading-tight text-surface-900 dark:text-white line-clamp-2">
+                {department?.name ?? APP_NAME}
+              </p>
+              {department?.description && (
+                <p
+                  className="mt-0.5 text-[11px] leading-snug text-surface-500 dark:text-surface-400 line-clamp-2"
+                  title={department.description}
+                >
+                  {department.description}
+                </p>
+              )}
+              <p className="text-[10px] uppercase tracking-wider text-surface-400">{APP_NAME}</p>
+            </div>
+          </div>
+          <button
+            onClick={onMobileClose}
+            className="p-2 rounded-lg text-surface-500 hover:bg-surface-100 dark:hover:bg-surface-800 transition-colors"
+            aria-label="Close sidebar"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Mobile user profile */}
+        {user && (
+          <div className="px-4 py-4 border-b border-surface-100 dark:border-surface-800">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-gradient-to-br from-primary-400 to-accent-500 flex items-center justify-center text-white text-sm font-semibold shrink-0">
+                {user.avatar ? (
+                  <img
+                    src={getMediaUrl(user.avatar) ?? undefined}
+                    alt=""
+                    className="w-full h-full rounded-full object-cover"
+                  />
+                ) : (
+                  `${(user.firstName || '').charAt(0)}${(user.lastName || '').charAt(0)}`
+                )}
+              </div>
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-surface-900 dark:text-surface-100 truncate">
+                  {user.firstName || 'User'} {user.lastName || ''}
+                </p>
+                <p className="text-xs text-surface-500 dark:text-surface-400 capitalize">
+                  {activeRole.replace('_', ' ')}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Mobile navigation */}
+        <nav className="flex-1 overflow-y-auto py-2 scrollbar-thin">
+          {/* Dashboard (always visible) */}
+          <NavLink
+            to="/dashboard"
+            onClick={onMobileClose}
+            className={({ isActive }) =>
+              cn(
+                'flex items-center gap-3 px-4 py-3 mx-2 rounded-xl text-sm font-medium transition-colors',
+                isActive
+                  ? 'bg-primary-50 text-primary-600 dark:bg-primary-950/20 dark:text-primary-400'
+                  : 'text-surface-700 dark:text-surface-300 hover:bg-surface-50 dark:hover:bg-surface-800',
+              )
+            }
+          >
+            <LayoutDashboard className="w-5 h-5 shrink-0" />
+            Dashboard
+          </NavLink>
+
+          {isPendingApproval ? (
+            <div className="px-6 py-8 text-center">
+              <Clock className="w-8 h-8 mx-auto text-amber-400 mb-3" />
+              <p className="text-sm font-semibold text-surface-700 dark:text-surface-200">Waiting for Approval</p>
+              <p className="text-xs text-surface-400 dark:text-surface-500 mt-1">
+                Only Dashboard, Profile &amp; Logout are available
+              </p>
+            </div>
+          ) : (
+            <>
+              {/* Collapsible sections */}
+              {mobileSections.map((section) => {
+                const hasAccess = !section.roles || section.roles.some((r) => user?.roles.includes(r));
+                const isExpanded = expandedSections.includes(section.key);
+                const SectionIcon = section.icon;
+                const showLocked = section.locked && !isAlumni;
+
+                if (!hasAccess && !section.locked) return null;
+
+                return (
+                  <div key={section.key} className="mt-1">
+                    <button
+                      onClick={() => {
+                        if (showLocked) return;
+                        toggleSection(section.key);
+                      }}
+                      className={cn(
+                        'flex items-center justify-between w-full px-4 py-2.5 mx-2 text-xs font-semibold uppercase tracking-widest rounded-lg transition-colors',
+                        showLocked
+                          ? 'text-surface-400 dark:text-surface-600 cursor-default'
+                          : 'text-surface-500 dark:text-surface-400 hover:text-surface-700 dark:hover:text-surface-300 hover:bg-surface-50 dark:hover:bg-surface-800',
+                      )}
+                    >
+                      <span className="flex items-center gap-2">
+                        <SectionIcon className="h-4 w-4 shrink-0" aria-hidden="true" />
+                        {section.title}
+                        {showLocked && (
+                          <span className="text-[10px] uppercase tracking-wider text-surface-400 dark:text-surface-500 ml-1 px-1.5 py-0.5 rounded bg-surface-100 dark:bg-surface-800">
+                            Locked
+                          </span>
+                        )}
+                      </span>
+                      {!showLocked && (
+                        <ChevronDown
+                          className={cn('w-4 h-4 transition-transform duration-200', isExpanded && 'rotate-180')}
+                        />
+                      )}
+                    </button>
+
+                    {isExpanded && !showLocked && (
+                      <div className="ml-6 pl-2 border-l-2 border-surface-200 dark:border-surface-700 space-y-0.5">
+                        {section.items.map((item) => {
+                          const Icon = item.icon;
+                          return (
+                            <NavLink
+                              key={item.path}
+                              to={item.path}
+                              onClick={onMobileClose}
+                              className={({ isActive }) =>
+                                cn(
+                                  'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors',
+                                  isActive
+                                    ? 'bg-primary-50 text-primary-600 dark:bg-primary-950/20 dark:text-primary-400'
+                                    : 'text-surface-600 dark:text-surface-400 hover:bg-surface-50 dark:hover:bg-surface-800 hover:text-surface-800 dark:hover:text-surface-200',
+                                )
+                              }
+                            >
+                              <Icon className="w-4 h-4 shrink-0" />
+                              {item.label}
+                            </NavLink>
+                          );
+                        })}
+                        {section.locked && (
+                          <p className="px-3 py-2 text-xs text-surface-400 dark:text-surface-500 italic">
+                            {section.lockMessage}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    {showLocked && (
+                      <div className="ml-6 pl-2 border-l-2 border-surface-200 dark:border-surface-700 ml-6 pl-2">
+                        <p className="px-3 py-2 text-xs text-surface-400 dark:text-surface-500 italic">
+                          {section.lockMessage}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </>
+          )}
+        </nav>
+
+        {/* Mobile footer */}
+        <div className="border-t border-surface-200 dark:border-surface-800 px-4 py-3 space-y-1">
+          <NavLink
+            to="/profile"
+            onClick={onMobileClose}
+            className={({ isActive }) =>
+              cn(
+                'flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors',
+                isActive
+                  ? 'bg-primary-50 text-primary-600 dark:bg-primary-950/20 dark:text-primary-400'
+                  : 'text-surface-700 dark:text-surface-300 hover:bg-surface-50 dark:hover:bg-surface-800',
+              )
+            }
+          >
+            <Settings className="w-5 h-5 shrink-0" />
+            Settings
+          </NavLink>
+          <button
+            onClick={() => {
+              logout();
+              onMobileClose();
+            }}
+            className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-sm font-medium text-danger-600 hover:bg-danger-50 dark:text-danger-400 dark:hover:bg-danger-950/20 transition-colors"
+          >
+            <LogOut className="w-5 h-5 shrink-0" />
+            Logout
+          </button>
+        </div>
+      </aside>
+
+      {/* ─── Desktop sidebar (in-flow) ─── */}
+      <aside
+        className={cn(
+          'hidden md:flex flex-col bg-white/95 dark:bg-surface-900/95 backdrop-blur-xl border-r border-surface-200 dark:border-surface-800 transition-all duration-300 ease-out shadow-2xl',
+          'relative h-full',
+          'w-16',
+          !collapsed && 'md:w-72',
+        )}
+      >
+        <div
+          className={cn(
+            'min-h-[4rem] py-3 flex items-center justify-center border-b border-surface-200 dark:border-surface-800',
+            !collapsed && 'md:justify-start md:px-6',
+          )}
+        >
+          <div className={cn('flex items-center', !collapsed ? 'md:gap-2' : 'flex-col')}>
+            <DepartmentLogo department={department} className="w-8 h-8 shadow-md" />
+            {!collapsed && (
+              <div className="hidden md:block min-w-0">
+                <p className="font-bold text-base leading-tight text-surface-900 dark:text-white line-clamp-2">
+                  {department?.name ?? APP_NAME}
+                </p>
+                {department?.description && (
+                  <p
+                    className="mt-0.5 text-[11px] leading-snug text-surface-500 dark:text-surface-400 line-clamp-2"
+                    title={department.description}
+                  >
+                    {department.description}
+                  </p>
+                )}
+                <p className="text-[10px] uppercase tracking-wider text-surface-400">{APP_NAME}</p>
+              </div>
+            )}
+          </div>
+        </div>
+        <nav className="flex-1 overflow-y-auto py-4 space-y-1 scrollbar-thin">
+          {desktopSections ? (
+            <>
+              {isStudentLike && renderDesktopItem(dashboardItem)}
+              {desktopSections.map((section) => renderDesktopSection(section))}
+              {renderDesktopItem(profileItem)}
+            </>
+          ) : (
+            filteredItems.map((item) => renderDesktopItem(item))
+          )}
+        </nav>
+        <div className={cn('border-t border-surface-200 dark:border-surface-800', 'p-1.5', !collapsed && 'md:p-4')}>
+          <button
+            onClick={onToggleCollapse}
+            className={cn(
+              'hidden md:flex items-center w-full justify-center p-2.5 rounded-xl transition-all duration-150 mb-1 text-surface-500 hover:bg-surface-100 dark:hover:bg-surface-800',
+              !collapsed && 'md:gap-3 md:px-3 md:py-2.5 md:text-sm md:font-medium',
+            )}
+            title={collapsed ? 'Expand' : 'Collapse'}
+          >
+            <ChevronLeft className={cn('w-4 h-4 shrink-0 transition-transform', collapsed && 'rotate-180')} />
+            {!collapsed && <span className="hidden md:inline">Collapse</span>}
+          </button>
+          <button
+            onClick={() => logout()}
+            className={cn(
+              'flex items-center w-full justify-center p-2.5 rounded-xl transition-all duration-150 text-danger-600 hover:bg-danger-50 dark:text-danger-400 dark:hover:bg-danger-950/20',
+              !collapsed && 'md:gap-3 md:px-3 md:py-2.5 md:text-sm md:font-medium',
+            )}
+            title="Logout"
+          >
+            <LogOut className="w-4 h-4 shrink-0" />
+            {!collapsed && <span className="hidden md:inline">Logout</span>}
+          </button>
+        </div>
+      </aside>
+    </>
+  );
+};
+
+export default Sidebar;

@@ -1,0 +1,58 @@
+version: "2"
+sql:
+  - schema: "internal/db/migrations"
+    queries: "internal/db/queries"
+    engine: "postgresql"
+    gen:
+      go:
+        package: "db"
+        out: "internal/db/sql"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_prepared_queries: true
+        # emit_interface is OFF: db/sql/querier.go is hand-maintained as the
+        # union of generated methods AND the hand-written *_custom.go methods
+        # (sqlc can only emit methods for .sql queries, so an auto-generated
+        # interface can never include the custom ones — and every regeneration
+        # would wipe manual additions). If you add/rename a query, update
+        # querier.go in the same change; the compiler flags every missed call
+        # site.
+        emit_exact_table_names: false
+        emit_empty_slices: true
+        emit_pointers_for_null_types: true
+        # NOTE: sqlc emits a Go model for EVERY table in the schema, even
+        # tables whose queries are hand-written in *_custom.go. If a custom
+        # struct must keep the table's name (joined fields, JSON-friendly
+        # null types), give the custom struct a distinct name instead —
+        # redeclaring the table name collides on the next `sqlc generate`.
+        # Queries that duplicate hand-written methods were removed from
+        # queries/*.sql for the same reason (search the *_custom.go files
+        # for "Generated in" comments).
+
+        overrides:
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+
+          - db_type: "pg_catalog.numeric"
+            go_type: "github.com/shopspring/decimal.Decimal"
+
+          - db_type: "pg_catalog.timestamp"
+            go_type: "time.Time"
+
+          - db_type: "pg_catalog.timestamptz"
+            go_type: "time.Time"
+
+          - db_type: "jsonb"
+            go_type: "encoding/json.RawMessage"
+
+          - db_type: "feed_post_type"
+            go_type: "string"
+
+          - db_type: "feed_audience"
+            go_type: "string"
+
+          - db_type: "reaction_type"
+            go_type: "string"
+
+          - db_type: "report_target_type"
+            go_type: "string"

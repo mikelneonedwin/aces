@@ -1,0 +1,401 @@
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { MessageCircle, X, Send, Bot, User, Sparkles, HelpCircle, Sun, Moon, Monitor } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { useNavigate } from 'react-router-dom';
+import { sendChatMessage, getQuickActions } from '../../api/ai';
+import type { QuickAction } from '../../api/ai';
+import { useDarkMode } from '../../hooks/useDarkMode';
+import { useRBAC } from '../../hooks/useRBAC';
+import { cn } from '../../utils/cn';
+
+interface Message {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: Date;
+  suggestions?: string[];
+  modelUsed?: string;
+  interactionId?: string;
+}
+
+const ChatbotWidget = () => {
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [quickActions, setQuickActions] = useState<QuickAction[]>([]);
+  const [sessionId] = useState(() => crypto.randomUUID());
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const { mode, setMode } = useDarkMode();
+  const navigate = useNavigate();
+  const { isAdmin, activeRole } = useRBAC();
+
+  const hideSupport = isAdmin || activeRole === 'lecturer';
+
+  const scrollToBottom = useCallback(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, []);
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, scrollToBottom]);
+
+  useEffect(() => {
+    if (isChatOpen && messages.length === 0) {
+      getQuickActions()
+        .then(setQuickActions)
+        .catch(() => {});
+      setMessages([
+        {
+          id: 'welcome',
+          role: 'assistant',
+          content:
+            "Hello! I'm your **ACES Assistant** 🤖\n\nI can help you with schedules, grades, dues, courses, mentorship, and more.\n\nTry a quick action below or just ask me anything!",
+          timestamp: new Date(),
+          suggestions: ['Show my schedule', 'Check my grades', 'How to pay dues'],
+        },
+      ]);
+    }
+    if (isChatOpen) {
+      setTimeout(() => inputRef.current?.focus(), 300);
+    }
+  }, [isChatOpen, messages.length]);
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setIsMenuOpen(false);
+      }
+    };
+    if (isMenuOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [isMenuOpen]);
+
+  const sendMessage = async (text: string) => {
+    if (!text.trim() || isLoading) return;
+
+    const userMsg: Message = {
+      id: `user-${Date.now()}`,
+      role: 'user',
+      content: text.trim(),
+      timestamp: new Date(),
+    };
+
+    setMessages((prev) => [...prev, userMsg]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const resp = await sendChatMessage(text, sessionId);
+
+      const assistantMsg: Message = {
+        id: `assistant-${Date.now()}`,
+        role: 'assistant',
+        content: resp.reply,
+        timestamp: new Date(),
+        suggestions: resp.suggestions,
+        modelUsed: resp.model_used,
+      };
+
+      setMessages((prev) => [...prev, assistantMsg]);
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `error-${Date.now()}`,
+          role: 'assistant',
+          content:
+            "I'm having trouble connecting right now. Please try again or contact the HOD office for assistance.",
+          timestamp: new Date(),
+        },
+      ]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage(input);
+    }
+  };
+
+  const cycleTheme = () => {
+    if (mode === 'light') setMode('dark');
+    else if (mode === 'dark') setMode('system');
+    else setMode('light');
+  };
+
+  const getThemeInfo = () => {
+    if (mode === 'dark') return { label: 'Theme: Dark', Icon: Moon, color: 'text-accent-400' };
+    if (mode === 'light') return { label: 'Theme: Light', Icon: Sun, color: 'text-amber-500' };
+    return { label: 'Theme: System', Icon: Monitor, color: 'text-indigo-400' };
+  };
+
+  const themeInfo = getThemeInfo();
+
+  const handleFabClick = () => {
+    if (isChatOpen) {
+      setIsChatOpen(false);
+    } else if (isMenuOpen) {
+      setIsMenuOpen(false);
+    } else {
+      setIsMenuOpen(true);
+    }
+  };
+
+  return (
+    <div ref={menuRef}>
+      {/* ── Chatbot Modal Window ── */}
+      <AnimatePresence>
+        {isChatOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: 20, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 20, scale: 0.95 }}
+            transition={{ duration: 0.2 }}
+            className="fixed inset-0 sm:inset-auto sm:bottom-20 sm:right-6 z-50 w-full sm:w-[calc(100vw-2rem)] sm:max-w-[400px] h-[100dvh] sm:h-[600px] sm:max-h-[calc(100vh-7rem)] bg-white dark:bg-surface-900 rounded-none sm:rounded-2xl shadow-2xl border-0 sm:border border-surface-200 dark:border-surface-700 flex flex-col overflow-hidden"
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between px-4 py-3 pt-[max(0.75rem,env(safe-area-inset-top))] bg-gradient-to-r from-primary-500 to-primary-600 text-white">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-full bg-white/20 flex items-center justify-center">
+                  <Bot className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold">ACES Assistant</h3>
+                  <p className="text-xs text-white/80">Online · Powered by AI</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsChatOpen(false)}
+                className="p-1 hover:bg-white/20 rounded-lg transition-colors"
+                aria-label="Close chatbot"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+              {messages.map((msg) => (
+                <div key={msg.id} className={cn('flex gap-2', msg.role === 'user' ? 'justify-end' : 'justify-start')}>
+                  {msg.role === 'assistant' && (
+                    <div className="w-7 h-7 rounded-full bg-primary-100 dark:bg-primary-900/30 flex items-center justify-center shrink-0 mt-1">
+                      <Bot className="w-4 h-4 text-primary-500" />
+                    </div>
+                  )}
+                  <div
+                    className={cn(
+                      'max-w-[80%] rounded-2xl px-3 py-2 text-sm',
+                      msg.role === 'user'
+                        ? 'bg-primary-500 text-white rounded-br-md'
+                        : 'bg-surface-100 dark:bg-surface-800 text-surface-800 dark:text-surface-200 rounded-bl-md',
+                    )}
+                  >
+                    <div
+                      className="whitespace-pre-wrap break-words"
+                      dangerouslySetInnerHTML={{ __html: formatMessage(msg.content) }}
+                    />
+                    {msg.modelUsed && msg.modelUsed !== 'disabled' && msg.modelUsed !== 'rate_limited' && (
+                      <div className="mt-1 flex items-center gap-1 text-[10px] text-surface-400">
+                        <Sparkles className="w-3 h-3" />
+                        <span>{msg.modelUsed}</span>
+                      </div>
+                    )}
+                  </div>
+                  {msg.role === 'user' && (
+                    <div className="w-7 h-7 rounded-full bg-surface-200 dark:bg-surface-700 flex items-center justify-center shrink-0 mt-1">
+                      <User className="w-4 h-4 text-surface-500" />
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {isLoading && (
+                <div className="flex gap-2 justify-start">
+                  <div className="w-7 h-7 rounded-full bg-primary-100 dark:bg-primary-900/30 flex items-center justify-center shrink-0">
+                    <Bot className="w-4 h-4 text-primary-500" />
+                  </div>
+                  <div className="bg-surface-100 dark:bg-surface-800 rounded-2xl rounded-bl-md px-4 py-3">
+                    <div className="flex gap-1">
+                      <div
+                        className="w-2 h-2 bg-surface-300 dark:bg-surface-600 rounded-full animate-bounce"
+                        style={{ animationDelay: '0ms' }}
+                      />
+                      <div
+                        className="w-2 h-2 bg-surface-300 dark:bg-surface-600 rounded-full animate-bounce"
+                        style={{ animationDelay: '150ms' }}
+                      />
+                      <div
+                        className="w-2 h-2 bg-surface-300 dark:bg-surface-600 rounded-full animate-bounce"
+                        style={{ animationDelay: '300ms' }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Suggestions */}
+              {messages.length > 0 &&
+                !isLoading &&
+                (() => {
+                  const lastAssistant = [...messages]
+                    .reverse()
+                    .find((m) => m.role === 'assistant' && m.suggestions?.length);
+                  if (!lastAssistant || lastAssistant.id === messages[messages.length - 1]?.id) return null;
+                  return (
+                    <div className="flex flex-wrap gap-1.5 ml-9">
+                      {lastAssistant.suggestions?.map((s, i) => (
+                        <button
+                          key={i}
+                          onClick={() => sendMessage(s)}
+                          className="text-xs px-3 py-1.5 rounded-full bg-primary-50 dark:bg-primary-950/30 text-primary-600 dark:text-primary-400 border border-primary-200 dark:border-primary-800 hover:bg-primary-100 dark:hover:bg-primary-900/50 transition-colors"
+                        >
+                          {s}
+                        </button>
+                      ))}
+                    </div>
+                  );
+                })()}
+
+              {/* Quick Actions (only show on welcome) */}
+              {messages.length <= 1 && quickActions.length > 0 && (
+                <div className="grid grid-cols-3 gap-2 ml-0">
+                  {quickActions.map((action) => (
+                    <button
+                      key={action.id}
+                      onClick={() => sendMessage(action.query)}
+                      className="flex flex-col items-center gap-1 p-3 rounded-xl bg-surface-50 dark:bg-surface-800 hover:bg-surface-100 dark:hover:bg-surface-700 border border-surface-200 dark:border-surface-700 transition-colors"
+                    >
+                      <span className="text-xl">{action.icon}</span>
+                      <span className="text-[11px] font-medium text-surface-600 dark:text-surface-400">
+                        {action.label}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Input */}
+            <div className="px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] border-t border-surface-200 dark:border-surface-700">
+              <div className="flex items-center gap-2">
+                <input
+                  ref={inputRef}
+                  type="text"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Ask me anything..."
+                  disabled={isLoading}
+                  className="flex-1 px-4 py-2.5 rounded-xl bg-surface-100 dark:bg-surface-800 text-sm placeholder:text-surface-400 focus:outline-none focus:ring-2 focus:ring-primary-500/30 disabled:opacity-50"
+                />
+                <button
+                  onClick={() => sendMessage(input)}
+                  disabled={!input.trim() || isLoading}
+                  className="p-2.5 rounded-xl bg-primary-500 text-white hover:bg-primary-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  <Send className="w-4 h-4" />
+                </button>
+              </div>
+              <p className="text-[10px] text-surface-400 mt-1.5 text-center">
+                AI responses may be inaccurate. Verify important info.
+              </p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Collapsible Speed Dial Menu Options ── */}
+      <AnimatePresence>
+        {isMenuOpen && !isChatOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: 15, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 15, scale: 0.95 }}
+            transition={{ duration: 0.2 }}
+            className="fixed bottom-20 right-4 sm:right-6 z-50 flex flex-col items-end gap-2.5"
+          >
+            {/* Theme Changer Option */}
+            <motion.button
+              whileHover={{ scale: 1.03, x: -2 }}
+              whileTap={{ scale: 0.97 }}
+              onClick={cycleTheme}
+              className="flex items-center gap-3 px-4 py-2.5 rounded-full bg-surface-900/90 dark:bg-surface-800/90 text-white border border-surface-700/60 shadow-xl backdrop-blur-md hover:bg-surface-800 dark:hover:bg-surface-700 transition-all text-sm font-medium cursor-pointer"
+            >
+              <themeInfo.Icon className={cn('w-4 h-4', themeInfo.color)} />
+              <span>{themeInfo.label}</span>
+            </motion.button>
+
+            {/* Support Page Option - students only, hidden for admin/lecturer roles */}
+            {!hideSupport && (
+              <motion.button
+                whileHover={{ scale: 1.03, x: -2 }}
+                whileTap={{ scale: 0.97 }}
+                onClick={() => {
+                  navigate('/support');
+                  setIsMenuOpen(false);
+                }}
+                className="flex items-center gap-3 px-4 py-2.5 rounded-full bg-surface-900/90 dark:bg-surface-800/90 text-white border border-surface-700/60 shadow-xl backdrop-blur-md hover:bg-surface-800 dark:hover:bg-surface-700 transition-all text-sm font-medium cursor-pointer"
+              >
+                <HelpCircle className="w-4 h-4 text-sky-400" />
+                <span>Support Page</span>
+              </motion.button>
+            )}
+
+            {/* AI Chatbot Option */}
+            <motion.button
+              whileHover={{ scale: 1.03, x: -2 }}
+              whileTap={{ scale: 0.97 }}
+              onClick={() => {
+                setIsChatOpen(true);
+                setIsMenuOpen(false);
+              }}
+              className="flex items-center gap-3 px-4 py-2.5 rounded-full bg-surface-900/90 dark:bg-surface-800/90 text-white border border-surface-700/60 shadow-xl backdrop-blur-md hover:bg-surface-800 dark:hover:bg-surface-700 transition-all text-sm font-medium cursor-pointer"
+            >
+              <MessageCircle className="w-4 h-4 text-primary-400" />
+              <span>AI Chatbot</span>
+            </motion.button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Main Collapsible Footer Button ── */}
+      {/* Hidden on mobile while the chat is open since it goes full-screen
+          there and the header's own close button already covers that job;
+          the FAB would otherwise float on top of the fullscreen chat. */}
+      <motion.button
+        onClick={handleFabClick}
+        className={cn(
+          'fixed bottom-4 right-4 sm:right-6 z-50 w-14 h-14 rounded-full shadow-2xl items-center justify-center transition-all duration-300 border border-surface-200/20 dark:border-surface-700/50',
+          isChatOpen ? 'hidden sm:flex' : 'flex',
+          isMenuOpen || isChatOpen
+            ? 'bg-surface-200 dark:bg-surface-800 text-surface-900 dark:text-white'
+            : 'bg-primary-500 text-white hover:bg-primary-600',
+        )}
+        whileHover={{ scale: 1.05 }}
+        whileTap={{ scale: 0.95 }}
+        aria-label="Toggle action menu"
+      >
+        {isMenuOpen || isChatOpen ? <X className="w-6 h-6" /> : <Sparkles className="w-6 h-6" />}
+      </motion.button>
+    </div>
+  );
+};
+
+function formatMessage(content: string): string {
+  return content.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br/>');
+}
+
+export default ChatbotWidget;

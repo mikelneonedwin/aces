@@ -1,0 +1,159 @@
+package service
+
+import (
+	"context"
+	"fmt"
+
+	db "github.com/aces/backend/internal/db/sql"
+	"github.com/google/uuid"
+)
+
+type CampusConnectService struct {
+	// store is the concrete *db.Queries (not the generated Querier
+	// interface) because several Connect queries (DM/group conversations,
+	// invite codes, member roles) are hand-written in db/sql/custom.go and
+	// therefore not part of the interface.
+	store *db.Queries
+}
+
+func NewCampusConnectService(store db.Querier) *CampusConnectService {
+	if q, ok := store.(*db.Queries); ok {
+		return &CampusConnectService{store: q}
+	}
+	// Transaction-backed stores are wrapped below; unreachable in the
+	// current wiring where the pool-backed *db.Queries is always passed.
+	return &CampusConnectService{store: nil}
+}
+
+// Connections
+func (s *CampusConnectService) SendConnectionRequest(ctx context.Context, requesterID, receiverID uuid.UUID, message *string) (db.Connection, error) {
+	if requesterID == receiverID {
+		return db.Connection{}, fmt.Errorf("cannot send a connection request to yourself")
+	}
+	exists, _ := s.store.CheckConnectionExists(ctx, db.CheckConnectionExistsParams{RequesterID: requesterID, ReceiverID: receiverID})
+	if exists {
+		return db.Connection{}, fmt.Errorf("a connection request already exists between you and this user")
+	}
+	return s.store.CreateConnection(ctx, db.CreateConnectionParams{
+		RequesterID: requesterID, ReceiverID: receiverID, Message: message,
+	})
+}
+
+func (s *CampusConnectService) RespondToConnection(ctx context.Context, id uuid.UUID, status string) (db.Connection, error) {
+	return s.store.UpdateConnectionStatus(ctx, db.UpdateConnectionStatusParams{ID: id, Status: db.ConnectionStatus(status)})
+}
+
+func (s *CampusConnectService) ListConnections(ctx context.Context, userID uuid.UUID, limit, offset int32) ([]db.ListUserConnectionsRow, error) {
+	return s.store.ListUserConnections(ctx, db.ListUserConnectionsParams{RequesterID: userID, Limit: limit, Offset: offset})
+}
+
+func (s *CampusConnectService) ListPendingRequests(ctx context.Context, userID uuid.UUID) ([]db.ListPendingConnectionRequestsRow, error) {
+	return s.store.ListPendingConnectionRequests(ctx, userID)
+}
+
+// Messages
+func (s *CampusConnectService) SendMessage(ctx context.Context, senderID, receiverID uuid.UUID, content string) (db.Message, error) {
+	return s.store.CreateMessage(ctx, db.CreateMessageParams{SenderID: senderID, ReceiverID: receiverID, Content: content})
+}
+
+func (s *CampusConnectService) ListConversation(ctx context.Context, userID1, userID2 uuid.UUID, limit, offset int32) ([]db.Message, error) {
+	return s.store.ListConversation(ctx, db.ListConversationParams{SenderID: userID1, ReceiverID: userID2, Limit: limit, Offset: offset})
+}
+
+func (s *CampusConnectService) MarkMessageRead(ctx context.Context, id uuid.UUID) (db.Message, error) {
+	return s.store.MarkMessageRead(ctx, id)
+}
+
+// Groups
+func (s *CampusConnectService) CreateGroup(ctx context.Context, params db.CreateGroupParams) (db.Group, error) {
+	group, err := s.store.CreateGroup(ctx, params)
+	if err != nil {
+		return db.Group{}, err
+	}
+	// Auto-add creator as admin
+	_, _ = s.store.AddGroupMember(ctx, db.AddGroupMemberParams{GroupID: group.ID, UserID: params.CreatedBy, Role: "admin"})
+	return group, nil
+}
+
+func (s *CampusConnectService) GetGroup(ctx context.Context, id uuid.UUID) (db.Group, error) {
+	return s.store.GetGroup(ctx, id)
+}
+
+func (s *CampusConnectService) ListGroups(ctx context.Context, limit, offset int32) ([]db.ListGroupsRow, error) {
+	return s.store.ListGroups(ctx, db.ListGroupsParams{Limit: limit, Offset: offset})
+}
+
+func (s *CampusConnectService) ListUserGroups(ctx context.Context, userID uuid.UUID) ([]db.ListUserGroupsRow, error) {
+	return s.store.ListUserGroups(ctx, userID)
+}
+
+func (s *CampusConnectService) JoinGroup(ctx context.Context, groupID, userID uuid.UUID) (db.GroupMember, error) {
+	return s.store.AddGroupMember(ctx, db.AddGroupMemberParams{GroupID: groupID, UserID: userID, Role: "member"})
+}
+
+func (s *CampusConnectService) LeaveGroup(ctx context.Context, groupID, userID uuid.UUID) error {
+	return s.store.RemoveGroupMember(ctx, db.RemoveGroupMemberParams{GroupID: groupID, UserID: userID})
+}
+
+func (s *CampusConnectService) ListGroupMembers(ctx context.Context, groupID uuid.UUID) ([]db.ListGroupMembersRow, error) {
+	return s.store.ListGroupMembers(ctx, groupID)
+}
+
+func (s *CampusConnectService) SendGroupMessage(ctx context.Context, groupID, senderID uuid.UUID, content string) (db.GroupMessage, error) {
+	return s.store.CreateGroupMessage(ctx, db.CreateGroupMessageParams{GroupID: groupID, SenderID: senderID, Content: content})
+}
+
+func (s *CampusConnectService) ListGroupMessages(ctx context.Context, groupID uuid.UUID, limit, offset int32) ([]db.ListGroupMessagesRow, error) {
+	return s.store.ListGroupMessages(ctx, db.ListGroupMessagesParams{GroupID: groupID, Limit: limit, Offset: offset})
+}
+
+func (s *CampusConnectService) CheckGroupMembership(ctx context.Context, groupID, userID uuid.UUID) (bool, error) {
+	return s.store.CheckGroupMembership(ctx, db.CheckGroupMembershipParams{GroupID: groupID, UserID: userID})
+}
+
+func (s *CampusConnectService) GetGroupMemberRole(ctx context.Context, groupID, userID uuid.UUID) (string, error) {
+	return s.store.GetGroupMemberRole(ctx, groupID, userID)
+}
+
+func (s *CampusConnectService) EnsureGroupInviteCode(ctx context.Context, groupID uuid.UUID) (string, error) {
+	return s.store.EnsureGroupInviteCode(ctx, groupID)
+}
+
+func (s *CampusConnectService) GetGroupByInviteCode(ctx context.Context, code string) (db.GroupByCodeRow, error) {
+	return s.store.GetGroupByInviteCode(ctx, code)
+}
+
+func (s *CampusConnectService) ListPublicGroups(ctx context.Context, limit, offset int32) ([]db.ListGroupsRow, error) {
+	return s.store.ListGroups(ctx, db.ListGroupsParams{Limit: limit, Offset: offset})
+}
+
+// AddMember adds someone else to a group (an admin/moderator inviting a
+// specific person), as opposed to JoinGroup which is always the caller
+// joining themselves.
+func (s *CampusConnectService) AddMember(ctx context.Context, groupID, userID uuid.UUID) (db.GroupMember, error) {
+	return s.store.AddGroupMember(ctx, db.AddGroupMemberParams{GroupID: groupID, UserID: userID, Role: "member"})
+}
+
+// Conversation previews — list + last-message snippet, for the Connect page's chat list panels.
+func (s *CampusConnectService) ListDMConversations(ctx context.Context, userID uuid.UUID) ([]db.DMConversationRow, error) {
+	return s.store.ListDMConversations(ctx, userID)
+}
+
+func (s *CampusConnectService) ListGroupConversations(ctx context.Context, userID uuid.UUID) ([]db.GroupConversationRow, error) {
+	return s.store.ListGroupConversations(ctx, userID)
+}
+
+// Directory
+func (s *CampusConnectService) GetStudentDirectory(ctx context.Context, userID uuid.UUID, limit, offset int32) ([]db.GetStudentDirectoryRow, error) {
+	// The .sql query names its exclusion parameter $1 (used 5×), which sqlc
+	// names after the first column it matches — hence ID, not UserID.
+	return s.store.GetStudentDirectory(ctx, db.GetStudentDirectoryParams{ID: userID, Limit: limit, Offset: offset})
+}
+
+func (s *CampusConnectService) GetAlumniDirectory(ctx context.Context, limit, offset int32) ([]db.GetAlumniDirectoryRow, error) {
+	return s.store.GetAlumniDirectory(ctx, db.GetAlumniDirectoryParams{Limit: limit, Offset: offset})
+}
+
+func (s *CampusConnectService) GetAllConnectionUserIds(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	return s.store.GetAllConnectionUserIds(ctx, userID)
+}

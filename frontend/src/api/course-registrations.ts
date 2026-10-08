@@ -1,0 +1,181 @@
+import apiClient, { unwrap } from './client';
+
+interface BackendRegistration {
+  id: string;
+  student_id: string;
+  session_id: string;
+  semester_id: string;
+  total_units: number;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface BackendRegisteredCourse {
+  id: string;
+  registration_id: string;
+  course_id: string;
+  status: string;
+  grade?: string;
+  grade_point?: number;
+  ca_score?: number;
+  exam_score?: number;
+  is_carryover: boolean;
+  previous_attempt_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface RegistrationWithCourses {
+  registration: BackendRegistration;
+  registered_courses: BackendRegisteredCourse[];
+}
+
+interface BackendRegistrationDetail {
+  id: string;
+  student_id: string;
+  session_id: string;
+  semester_id: string;
+  total_units: number;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  registered_courses: BackendRegisteredCourse[];
+}
+
+export interface CourseRegistration {
+  id: string;
+  studentId: string;
+  sessionId: string;
+  semesterId: string;
+  totalUnits: number;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RegisteredCourse {
+  id: string;
+  registrationId: string;
+  courseId: string;
+  status: string;
+  grade?: string;
+  gradePoint?: number;
+  caScore?: number;
+  examScore?: number;
+  isCarryover: boolean;
+  previousAttemptId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RawSession {
+  id: string;
+  name?: string;
+  start_date?: string;
+  end_date?: string;
+  startDate?: string;
+  endDate?: string;
+}
+
+export interface RawSemester {
+  id: string;
+  name?: string;
+  season?: string;
+  start_date?: string;
+  end_date?: string;
+  startDate?: string;
+  endDate?: string;
+}
+
+export const getActiveSessionAndSemester = async () => {
+  const [sessionsRes] = await Promise.all([apiClient.get('/sessions', { params: { page_id: 1, page_size: 5 } })]);
+  const sessionsData = unwrap<RawSession[] | { data: RawSession[] }>(sessionsRes);
+  const sessions = Array.isArray(sessionsData) ? sessionsData : (sessionsData?.data ?? []);
+  if (sessions.length === 0) return { session: null, semester: null };
+  const session = sessions[0];
+
+  const semsRes = await apiClient.get(`/semesters/session/${session.id}`);
+  const semsData = unwrap<RawSemester[] | { data: RawSemester[] }>(semsRes);
+  const semesters = Array.isArray(semsData) ? semsData : (semsData?.data ?? []);
+  if (semesters.length === 0) return { session, semester: null };
+
+  const now = new Date().toISOString();
+  const activeSem =
+    semesters.find((s) => {
+      const start = s.start_date || s.startDate || '';
+      const end = s.end_date || s.endDate || '';
+      if (start && end) return now >= start && now <= end;
+      return true;
+    }) || semesters[semesters.length - 1];
+
+  return { session, semester: activeSem };
+};
+
+export const submitRegistration = async (payload: {
+  session_id: string;
+  semester_id: string;
+  course_ids: string[];
+}) => {
+  const res = await apiClient.post('/course-registrations/submit', payload);
+  return unwrap<RegistrationWithCourses>(res);
+};
+
+export const getMyRegisteredCourseIDs = async () => {
+  const res = await apiClient.get('/course-registrations/my-course-ids');
+  const raw = unwrap<{ data: string[] } | string[]>(res);
+  return Array.isArray(raw) ? raw : (raw?.data ?? []);
+};
+
+export const getStudentRegistrations = async (studentId: string) => {
+  const res = await apiClient.get(`/course-registrations/student/${studentId}`);
+  const raw = unwrap<BackendRegistrationDetail[] | { data: BackendRegistrationDetail[] }>(res);
+  return Array.isArray(raw) ? raw : (raw?.data ?? []);
+};
+
+export const getRegistrationById = async (registrationId: string) => {
+  const res = await apiClient.get(`/course-registrations/${registrationId}`);
+  return unwrap<BackendRegistrationDetail>(res);
+};
+
+export const getRegisteredCourses = async (registrationId: string) => {
+  const res = await apiClient.get(`/course-registrations/${registrationId}/courses`);
+  const raw = unwrap<BackendRegisteredCourse[] | { data: BackendRegisteredCourse[] }>(res);
+  return Array.isArray(raw) ? raw : (raw?.data ?? []);
+};
+
+export const createRegistration = async (payload: {
+  student_id: string;
+  session_id: string;
+  semester_id: string;
+  total_units?: number;
+  status?: string;
+}) => {
+  const res = await apiClient.post('/course-registrations', payload);
+  return unwrap<BackendRegistration>(res);
+};
+
+export const addCourseToRegistration = async (
+  registrationId: string,
+  payload: {
+    course_id: string;
+    status?: string;
+    is_carryover?: boolean;
+  },
+) => {
+  const res = await apiClient.post(`/course-registrations/${registrationId}/courses`, payload);
+  return unwrap<BackendRegisteredCourse>(res);
+};
+
+export const removeCourseFromRegistration = async (registrationId: string, registeredCourseId: string) => {
+  await apiClient.delete(`/course-registrations/${registrationId}/courses/${registeredCourseId}`);
+};
+
+export const updateRegistrationStatus = async (registrationId: string, status: string) => {
+  const res = await apiClient.put(`/course-registrations/${registrationId}`, { status });
+  return unwrap<BackendRegistration>(res);
+};
+
+export const deleteCourseRegistration = async (registrationId: string) => {
+  await apiClient.delete(`/course-registrations/${registrationId}`);
+};

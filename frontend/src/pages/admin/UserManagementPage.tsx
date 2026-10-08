@@ -1,0 +1,863 @@
+import { useState, useEffect, useCallback } from 'react';
+import { Link } from 'react-router-dom';
+import Card from '../../components/ui/Card';
+import Select from '../../components/ui/Select';
+import Button from '../../components/ui/Button';
+import DataTable from '../../components/data-display/DataTable';
+import StatusBadge from '../../components/data-display/StatusBadge';
+import RoleBadge from '../../components/data-display/RoleBadge';
+import { useNotification } from '../../hooks/useNotification';
+import {
+  Search,
+  UserCheck,
+  ShieldAlert,
+  Loader2,
+  UserPlus,
+  X,
+  RotateCcw,
+  Pencil,
+  Trash2,
+  AlertTriangle,
+} from 'lucide-react';
+import { getUsers, getUser, approveUser, updateUser, createUser, deleteUser } from '../../api/users';
+import { useAuth } from '../../hooks/useAuth';
+import { getErrorMessage } from '../../utils/errors';
+import type { User, UserRole } from '../../types';
+
+// The user detail/list endpoints normally return camelCase fields (per the
+// backend's userResponse struct), but this page defensively also checks for
+// snake_case equivalents in case an older/alternate endpoint shape is hit.
+type ExtendedUser = User & {
+  first_name?: string;
+  last_name?: string;
+  date_of_birth?: string;
+  matric_number?: string;
+  admission_mode?: string;
+  year_admitted?: number | string;
+  emergency_contact_name?: string;
+  emergency_contact_phone?: string;
+  home_address?: string;
+};
+
+interface UpdateUserPayload {
+  first_name?: string;
+  last_name?: string;
+  email?: string;
+  phone?: string;
+  role?: string;
+  dateOfBirth?: string;
+  matricNumber?: string;
+  level?: string;
+  admissionMode?: string;
+  yearAdmitted?: string;
+  emergencyContactName?: string;
+  emergencyContactPhone?: string;
+  homeAddress?: string;
+}
+
+const getDisplayName = (u: User) => {
+  const firstName = u.firstName || '';
+  const lastName = u.lastName || '';
+  const middleName = u.middleName || u.middle_name || '';
+  const fullName = u.fullName || u.full_name || '';
+
+  if (firstName || lastName) {
+    const base = lastName ? `${lastName}, ${firstName}` : firstName;
+    return middleName ? `${base} ${middleName}` : base;
+  }
+  if (fullName) {
+    return fullName;
+  }
+  return u.email;
+};
+
+const UserManagementPage = () => {
+  const { success, error: notifyError } = useNotification();
+  const { user: currentUser } = useAuth();
+  const [roleFilter, setRoleFilter] = useState('all');
+  const [search, setSearch] = useState('');
+  const [users, setUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [addForm, setAddForm] = useState({
+    email: '',
+    password: '',
+    first_name: '',
+    last_name: '',
+    role: 'student',
+    phone: '',
+  });
+  const [addLoading, setAddLoading] = useState(false);
+  const [editUser, setEditUser] = useState<User | null>(null);
+  const [editForm, setEditForm] = useState({
+    first_name: '',
+    last_name: '',
+    email: '',
+    phone: '',
+    role: 'student',
+    dateOfBirth: '',
+    matricNumber: '',
+    level: '',
+    admissionMode: '',
+    yearAdmitted: '',
+    emergencyContactName: '',
+    emergencyContactPhone: '',
+    homeAddress: '',
+  });
+  const [editLoading, setEditLoading] = useState(false);
+  const [deleteUserTarget, setDeleteUserTarget] = useState<User | null>(null);
+  const [deleteLoading, setDeleteLoading] = useState(false);
+
+  const fetchUsers = useCallback(async () => {
+    try {
+      setLoading(true);
+      const result = await getUsers({ page: 1, perPage: 100 });
+      setUsers(Array.isArray(result) ? result : []);
+    } catch (err) {
+      notifyError('Load Failed', getErrorMessage(err, 'Could not load users'));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchUsers();
+  }, [fetchUsers]);
+
+  const getUserAllRoles = (u: User): UserRole[] => {
+    if (Array.isArray(u.allRoles) && u.allRoles.length > 0) return u.allRoles;
+    if (Array.isArray(u.roles) && u.roles.length > 0) return u.roles;
+    if (u.role) return [u.role];
+    return [];
+  };
+
+  const filtered = users.filter((u) => {
+    const allRoles = getUserAllRoles(u);
+    const matchesRole = roleFilter === 'all' || allRoles.includes(roleFilter as UserRole);
+    const name = getDisplayName(u);
+    const matchesSearch =
+      name.toLowerCase().includes(search.toLowerCase()) || u.email.toLowerCase().includes(search.toLowerCase());
+    return matchesRole && matchesSearch;
+  });
+
+  const handleApprove = async (id: string) => {
+    try {
+      setActionLoading(id);
+      await approveUser(id);
+      setUsers((prev) => prev.map((u) => (u.id === id ? { ...u, isApproved: true } : u)));
+      success('User Approved', 'Account activated successfully');
+    } catch (err) {
+      notifyError('Approval Failed', getErrorMessage(err, 'Could not approve user'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleSuspend = async (id: string) => {
+    if (id === currentUser?.id) {
+      notifyError('Not Allowed', 'You cannot suspend your own account');
+      return;
+    }
+    try {
+      setActionLoading(id);
+      await updateUser(id, { isActive: false });
+      setUsers((prev) => prev.map((u) => (u.id === id ? { ...u, isActive: false } : u)));
+      success('User Suspended', 'Account access suspended');
+    } catch (err) {
+      notifyError('Suspend Failed', getErrorMessage(err, 'Could not suspend user'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleReactivate = async (id: string) => {
+    try {
+      setActionLoading(id);
+      await updateUser(id, { isActive: true });
+      setUsers((prev) => prev.map((u) => (u.id === id ? { ...u, isActive: true } : u)));
+      success('User Reactivated', 'Account access restored');
+    } catch (err) {
+      notifyError('Reactivation Failed', getErrorMessage(err, 'Could not reactivate user'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleAddUser = async () => {
+    try {
+      setAddLoading(true);
+      await createUser({
+        email: addForm.email,
+        password: addForm.password,
+        first_name: addForm.first_name,
+        last_name: addForm.last_name,
+        role: addForm.role,
+        phone: addForm.phone || undefined,
+      });
+      success('User Created', 'New account has been created');
+      setShowAddModal(false);
+      setAddForm({ email: '', password: '', first_name: '', last_name: '', role: 'student', phone: '' });
+      fetchUsers();
+    } catch (err) {
+      notifyError('Create Failed', getErrorMessage(err, 'Could not create user'));
+    } finally {
+      setAddLoading(false);
+    }
+  };
+
+  const openEditModal = async (user: User) => {
+    setEditUser(user);
+    const eu = user as ExtendedUser;
+    setEditForm({
+      first_name: eu.firstName || eu.first_name || '',
+      last_name: eu.lastName || eu.last_name || '',
+      email: eu.email,
+      phone: eu.phone || '',
+      role: eu.role || eu.activeRole || 'student',
+      dateOfBirth: eu.dateOfBirth || eu.date_of_birth || '',
+      matricNumber: eu.matricNumber || eu.matric_number || '',
+      level: eu.level ? String(eu.level) : '',
+      admissionMode: eu.admissionMode || eu.admission_mode || '',
+      yearAdmitted: eu.yearAdmitted ? String(eu.yearAdmitted) : eu.year_admitted ? String(eu.year_admitted) : '',
+      emergencyContactName: eu.emergencyContactName || eu.emergency_contact_name || '',
+      emergencyContactPhone: eu.emergencyContactPhone || eu.emergency_contact_phone || '',
+      homeAddress: eu.homeAddress || eu.home_address || '',
+    });
+
+    try {
+      const fullUser = (await getUser(user.id)) as ExtendedUser;
+      if (fullUser) {
+        setEditForm({
+          first_name: fullUser.firstName || fullUser.first_name || '',
+          last_name: fullUser.lastName || fullUser.last_name || '',
+          email: fullUser.email || '',
+          phone: fullUser.phone || '',
+          role: fullUser.role || fullUser.activeRole || 'student',
+          dateOfBirth: fullUser.dateOfBirth || fullUser.date_of_birth || '',
+          matricNumber: fullUser.matricNumber || fullUser.matric_number || '',
+          level: fullUser.level ? String(fullUser.level) : '',
+          admissionMode: fullUser.admissionMode || fullUser.admission_mode || '',
+          yearAdmitted: fullUser.yearAdmitted
+            ? String(fullUser.yearAdmitted)
+            : fullUser.year_admitted
+              ? String(fullUser.year_admitted)
+              : '',
+          emergencyContactName: fullUser.emergencyContactName || fullUser.emergency_contact_name || '',
+          emergencyContactPhone: fullUser.emergencyContactPhone || fullUser.emergency_contact_phone || '',
+          homeAddress: fullUser.homeAddress || fullUser.home_address || '',
+        });
+      }
+    } catch (e) {
+      console.error('Failed to fetch full user profile for modal', e);
+    }
+  };
+
+  const handleEditSubmit = async () => {
+    if (!editUser) return;
+    try {
+      setEditLoading(true);
+      const payload: UpdateUserPayload = {
+        first_name: editForm.first_name,
+        last_name: editForm.last_name,
+        email: editForm.email,
+        phone: editForm.phone,
+        role: editForm.role,
+        dateOfBirth: editForm.dateOfBirth || undefined,
+        matricNumber: editForm.matricNumber || undefined,
+        level: editForm.level || undefined,
+        admissionMode: editForm.admissionMode || undefined,
+        yearAdmitted: editForm.yearAdmitted || undefined,
+        emergencyContactName: editForm.emergencyContactName || undefined,
+        emergencyContactPhone: editForm.emergencyContactPhone || undefined,
+        homeAddress: editForm.homeAddress || undefined,
+      };
+      // The update endpoint accepts a slightly different payload shape than
+      // the User read-model (e.g. snake_case names, string-typed level/year),
+      // so it's sent through as an intentional cast rather than reshaping
+      // the request body.
+      const res = (await updateUser(editUser.id, payload as unknown as Partial<User>)) as unknown as User & {
+        data?: Partial<User>;
+      };
+
+      const updatedUser = res?.data || res || {};
+      setUsers((prev) =>
+        prev.map((u) => {
+          if (u.id !== editUser.id) return u;
+          return {
+            ...u,
+            ...updatedUser,
+            firstName: editForm.first_name,
+            lastName: editForm.last_name,
+            email: editForm.email,
+            phone: editForm.phone,
+            role: editForm.role as UserRole,
+            activeRole: editForm.role as UserRole,
+            dateOfBirth: editForm.dateOfBirth,
+            matricNumber: editForm.matricNumber,
+            level: editForm.level ? Number(editForm.level) : u.level,
+            admissionMode: editForm.admissionMode,
+            yearAdmitted: editForm.yearAdmitted ? Number(editForm.yearAdmitted) : u.yearAdmitted,
+            emergencyContactName: editForm.emergencyContactName,
+            emergencyContactPhone: editForm.emergencyContactPhone,
+            homeAddress: editForm.homeAddress,
+          };
+        }),
+      );
+      success('User Updated', 'User details have been saved');
+      setEditUser(null);
+    } catch (err) {
+      notifyError('Update Failed', getErrorMessage(err, 'Could not update user'));
+    } finally {
+      setEditLoading(false);
+    }
+  };
+
+  const handleDeleteUser = async () => {
+    if (!deleteUserTarget) return;
+    setDeleteLoading(true);
+    try {
+      await deleteUser(deleteUserTarget.id);
+      setUsers((prev) => prev.filter((u) => u.id !== deleteUserTarget.id));
+      success('User Deleted', `${getDisplayName(deleteUserTarget)} has been permanently removed`);
+      setDeleteUserTarget(null);
+    } catch (err) {
+      notifyError('Delete Failed', getErrorMessage(err, 'Could not delete user'));
+    } finally {
+      setDeleteLoading(false);
+    }
+  };
+
+  const columns = [
+    {
+      key: 'name',
+      label: 'Name',
+      render: (_: unknown, row: User) => {
+        const displayName = getDisplayName(row);
+        const userRole = row.role || row.activeRole || (row.roles && row.roles[0]) || '';
+        const isStudent = userRole === 'student';
+        const detailPath = isStudent ? `/admin/students/${row.id}` : `/admin/users/${row.id}`;
+        return (
+          <div>
+            <Link to={detailPath} className="font-semibold text-primary-600 dark:text-primary-400 hover:underline">
+              {displayName}
+            </Link>
+            <p className="text-[10px] text-surface-500">{row.email}</p>
+          </div>
+        );
+      },
+    },
+    {
+      key: 'role',
+      label: 'Roles',
+      render: (_: unknown, row: User) => {
+        const allRoles = getUserAllRoles(row);
+        return (
+          <div className="flex flex-wrap gap-1">
+            {allRoles.map((r) => (
+              <RoleBadge key={r} role={r} />
+            ))}
+          </div>
+        );
+      },
+    },
+    {
+      key: 'phone',
+      label: 'Phone',
+      render: (val: unknown) => (
+        <span className="text-sm text-surface-600 dark:text-surface-400">{(val as string) || '—'}</span>
+      ),
+    },
+    { key: 'status', label: 'Status', render: (val: unknown) => <StatusBadge status={val as string} /> },
+    {
+      key: 'action',
+      label: 'Actions',
+      render: (_: unknown, row: User) => {
+        const isLoading = actionLoading === row.id;
+        return (
+          <div className="flex gap-2 flex-wrap">
+            <Button
+              size="xs"
+              variant="ghost"
+              leftIcon={<Pencil className="w-3.5 h-3.5" />}
+              onClick={() => openEditModal(row)}
+            >
+              Edit
+            </Button>
+            {!row.isApproved && (
+              <Button
+                size="xs"
+                variant="success"
+                leftIcon={
+                  isLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <UserCheck className="w-3.5 h-3.5" />
+                }
+                onClick={() => handleApprove(row.id)}
+                disabled={isLoading}
+              >
+                Approve
+              </Button>
+            )}
+            {row.isActive && row.id !== currentUser?.id && (
+              <Button
+                size="xs"
+                variant="outline"
+                className="text-danger-500 hover:bg-danger-50"
+                leftIcon={<ShieldAlert className="w-3.5 h-3.5" />}
+                onClick={() => handleSuspend(row.id)}
+                disabled={isLoading}
+              >
+                Suspend
+              </Button>
+            )}
+            {!row.isActive && (
+              <Button
+                size="xs"
+                variant="outline"
+                className="text-success-600 hover:bg-success-50"
+                leftIcon={<RotateCcw className="w-3.5 h-3.5" />}
+                onClick={() => handleReactivate(row.id)}
+                disabled={isLoading}
+              >
+                Reactivate
+              </Button>
+            )}
+            <Button
+              size="xs"
+              variant="ghost"
+              className="text-danger-500 hover:bg-danger-50"
+              leftIcon={<Trash2 className="w-3.5 h-3.5" />}
+              onClick={() => setDeleteUserTarget(row)}
+            >
+              Delete
+            </Button>
+          </div>
+        );
+      },
+    },
+  ];
+
+  const mappedUsers = filtered.map((u) => ({
+    ...u,
+    role: u.role || u.activeRole || (u.roles && u.roles.length > 0 ? u.roles[0] : ''),
+    allRoles: getUserAllRoles(u),
+    status: u.isActive ? (u.isApproved ? 'active' : 'pending') : 'suspended',
+  }));
+
+  const editModalIsStudent = editForm.role === 'student';
+  const inputCls =
+    'w-full px-3 py-2 text-sm bg-white dark:bg-surface-800 border border-surface-300 dark:border-surface-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500/20';
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-3xl font-bold text-surface-900 dark:text-white">User Directory</h1>
+          <p className="text-sm text-surface-500 dark:text-surface-400 mt-1">
+            Review, approve and manage system access settings for all department users.
+          </p>
+        </div>
+        <Button leftIcon={<UserPlus className="w-4 h-4" />} onClick={() => setShowAddModal(true)}>
+          Add User
+        </Button>
+      </div>
+
+      <div className="flex gap-4 max-w-xl">
+        <div className="flex-1 relative">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-surface-400" />
+          <input
+            type="text"
+            placeholder="Search directory..."
+            className="w-full pl-10 pr-4 py-2 text-sm bg-white dark:bg-surface-900 border border-surface-300 dark:border-surface-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500/20"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+        </div>
+        <Select
+          options={[
+            { value: 'all', label: 'All Roles' },
+            { value: 'student', label: 'Students' },
+            { value: 'lecturer', label: 'Lecturers' },
+            { value: 'class_rep', label: 'Class Reps' },
+            { value: 'hod', label: 'HOD' },
+            { value: 'delegated_admin', label: 'Admins' },
+            { value: 'class_bursar', label: 'Class Bursar' },
+            { value: 'dept_bursar', label: 'Dept Bursar' },
+          ]}
+          value={roleFilter}
+          onChange={(e) => setRoleFilter(e.target.value)}
+        />
+      </div>
+
+      <Card>
+        {loading ? (
+          <div className="flex items-center justify-center p-12">
+            <Loader2 className="w-6 h-6 animate-spin text-primary-500" />
+            <span className="ml-2 text-sm text-surface-500">Loading users...</span>
+          </div>
+        ) : (
+          <DataTable columns={columns} data={mappedUsers} />
+        )}
+      </Card>
+
+      {/* Add User Modal */}
+      {showAddModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="bg-white dark:bg-surface-900 rounded-xl shadow-xl w-full max-w-md p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-bold text-surface-900 dark:text-white">Add New User</h2>
+              <button onClick={() => setShowAddModal(false)} className="text-surface-400 hover:text-surface-600">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                    First Name
+                  </label>
+                  <input
+                    type="text"
+                    className={inputCls}
+                    value={addForm.first_name}
+                    onChange={(e) => setAddForm({ ...addForm, first_name: e.target.value })}
+                    placeholder="First name"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                    Last Name
+                  </label>
+                  <input
+                    type="text"
+                    className={inputCls}
+                    value={addForm.last_name}
+                    onChange={(e) => setAddForm({ ...addForm, last_name: e.target.value })}
+                    placeholder="Last name"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">Email</label>
+                <input
+                  type="email"
+                  className={inputCls}
+                  value={addForm.email}
+                  onChange={(e) => setAddForm({ ...addForm, email: e.target.value })}
+                  placeholder="user@example.com"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                  Password
+                </label>
+                <input
+                  type="password"
+                  className={inputCls}
+                  value={addForm.password}
+                  onChange={(e) => setAddForm({ ...addForm, password: e.target.value })}
+                  placeholder="Minimum 6 characters"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                  Phone (optional)
+                </label>
+                <input
+                  type="tel"
+                  className={inputCls}
+                  value={addForm.phone}
+                  onChange={(e) => setAddForm({ ...addForm, phone: e.target.value })}
+                  placeholder="08012345678"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">Role</label>
+                <Select
+                  options={[
+                    { value: 'student', label: 'Student' },
+                    { value: 'lecturer', label: 'Lecturer' },
+                    { value: 'class_rep', label: 'Class Rep' },
+                    { value: 'hod', label: 'HOD' },
+                    { value: 'class_bursar', label: 'Class Bursar' },
+                    { value: 'dept_bursar', label: 'Dept Bursar' },
+                  ]}
+                  value={addForm.role}
+                  onChange={(e) => setAddForm({ ...addForm, role: e.target.value })}
+                />
+              </div>
+            </div>
+
+            <div className="flex gap-3 justify-end pt-2">
+              <Button variant="outline" onClick={() => setShowAddModal(false)}>
+                Cancel
+              </Button>
+              <Button
+                leftIcon={addLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : undefined}
+                onClick={handleAddUser}
+                disabled={
+                  addLoading || !addForm.email || !addForm.password || !addForm.first_name || !addForm.last_name
+                }
+              >
+                Create User
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit User Modal */}
+      {editUser && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 overflow-y-auto">
+          <div className="bg-white dark:bg-surface-900 rounded-xl shadow-xl w-full max-w-lg p-6 space-y-4 my-8">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-bold text-surface-900 dark:text-white">Edit User Details</h2>
+              <button onClick={() => setEditUser(null)} className="text-surface-400 hover:text-surface-600">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3 max-h-[60vh] overflow-y-auto pr-1">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                    First Name
+                  </label>
+                  <input
+                    type="text"
+                    className={inputCls}
+                    value={editForm.first_name}
+                    onChange={(e) => setEditForm({ ...editForm, first_name: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                    Last Name
+                  </label>
+                  <input
+                    type="text"
+                    className={inputCls}
+                    value={editForm.last_name}
+                    onChange={(e) => setEditForm({ ...editForm, last_name: e.target.value })}
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">Email</label>
+                <input
+                  type="email"
+                  className={inputCls}
+                  value={editForm.email}
+                  onChange={(e) => setEditForm({ ...editForm, email: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">Phone</label>
+                <input
+                  type="tel"
+                  className={inputCls}
+                  value={editForm.phone}
+                  onChange={(e) => setEditForm({ ...editForm, phone: e.target.value })}
+                  placeholder="Not provided"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">Role</label>
+                <Select
+                  options={[
+                    { value: 'student', label: 'Student' },
+                    { value: 'lecturer', label: 'Lecturer' },
+                    { value: 'class_rep', label: 'Class Rep' },
+                    { value: 'hod', label: 'HOD' },
+                    { value: 'delegated_admin', label: 'Delegated Admin' },
+                    { value: 'class_bursar', label: 'Class Bursar' },
+                    { value: 'dept_bursar', label: 'Dept Bursar' },
+                  ]}
+                  value={editForm.role}
+                  onChange={(e) => setEditForm({ ...editForm, role: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                  Date of Birth
+                </label>
+                <input
+                  type="date"
+                  className={inputCls}
+                  value={editForm.dateOfBirth}
+                  onChange={(e) => setEditForm({ ...editForm, dateOfBirth: e.target.value })}
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                  Home Address
+                </label>
+                <input
+                  type="text"
+                  className={inputCls}
+                  value={editForm.homeAddress}
+                  onChange={(e) => setEditForm({ ...editForm, homeAddress: e.target.value })}
+                  placeholder="Not provided"
+                />
+              </div>
+
+              {/* Student-specific fields */}
+              {editModalIsStudent && (
+                <>
+                  <div className="border-t border-surface-200 dark:border-surface-700 pt-3 mt-3">
+                    <p className="text-xs font-semibold text-primary-500 uppercase tracking-wider mb-3">
+                      Student Details
+                    </p>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                        Matric Number
+                      </label>
+                      <input
+                        type="text"
+                        className={inputCls}
+                        value={editForm.matricNumber}
+                        onChange={(e) => setEditForm({ ...editForm, matricNumber: e.target.value })}
+                        placeholder="e.g. 19/ENG/COE/001"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                        Level
+                      </label>
+                      <Select
+                        options={[
+                          { value: '', label: 'Select' },
+                          { value: '100', label: '100 Level' },
+                          { value: '200', label: '200 Level' },
+                          { value: '300', label: '300 Level' },
+                          { value: '400', label: '400 Level' },
+                          { value: '500', label: '500 Level' },
+                        ]}
+                        value={editForm.level}
+                        onChange={(e) => setEditForm({ ...editForm, level: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                        Admission Mode
+                      </label>
+                      <Select
+                        options={[
+                          { value: '', label: 'Select' },
+                          { value: 'UTME', label: 'UTME' },
+                          { value: 'Direct Entry', label: 'Direct Entry' },
+                        ]}
+                        value={editForm.admissionMode}
+                        onChange={(e) => setEditForm({ ...editForm, admissionMode: e.target.value })}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                        Year Admitted
+                      </label>
+                      <input
+                        type="number"
+                        className={inputCls}
+                        value={editForm.yearAdmitted}
+                        onChange={(e) => setEditForm({ ...editForm, yearAdmitted: e.target.value })}
+                        placeholder="e.g. 2023"
+                        min="1900"
+                        max={new Date().getFullYear()}
+                      />
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* Emergency Contact */}
+              <div className="border-t border-surface-200 dark:border-surface-700 pt-3 mt-3">
+                <p className="text-xs font-semibold text-primary-500 uppercase tracking-wider mb-3">
+                  Emergency Contact
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                    Contact Name
+                  </label>
+                  <input
+                    type="text"
+                    className={inputCls}
+                    value={editForm.emergencyContactName}
+                    onChange={(e) => setEditForm({ ...editForm, emergencyContactName: e.target.value })}
+                    placeholder="Full name"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1">
+                    Contact Phone
+                  </label>
+                  <input
+                    type="tel"
+                    className={inputCls}
+                    value={editForm.emergencyContactPhone}
+                    onChange={(e) => setEditForm({ ...editForm, emergencyContactPhone: e.target.value })}
+                    placeholder="Phone number"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="flex gap-3 justify-end pt-2 border-t border-surface-200 dark:border-surface-700">
+              <Button variant="outline" onClick={() => setEditUser(null)}>
+                Cancel
+              </Button>
+              <Button
+                leftIcon={editLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : undefined}
+                onClick={handleEditSubmit}
+                disabled={editLoading || !editForm.first_name || !editForm.last_name || !editForm.email}
+              >
+                Save Changes
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {deleteUserTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="bg-white dark:bg-surface-900 rounded-xl shadow-xl w-full max-w-md p-6 space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-danger-100 dark:bg-danger-900/30 flex items-center justify-center">
+                <AlertTriangle className="w-5 h-5 text-danger-500" />
+              </div>
+              <div>
+                <h2 className="text-lg font-bold text-surface-900 dark:text-white">Delete User</h2>
+                <p className="text-sm text-surface-500">This action cannot be undone.</p>
+              </div>
+            </div>
+            <p className="text-sm text-surface-600 dark:text-surface-400">
+              Are you sure you want to permanently delete <strong>{getDisplayName(deleteUserTarget)}</strong> (
+              {deleteUserTarget.email})? All associated data will be removed.
+            </p>
+            <div className="flex gap-3 justify-end pt-2">
+              <Button variant="outline" onClick={() => setDeleteUserTarget(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="danger"
+                leftIcon={deleteLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                onClick={handleDeleteUser}
+                disabled={deleteLoading}
+              >
+                Delete Permanently
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default UserManagementPage;

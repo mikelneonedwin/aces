@@ -1,0 +1,213 @@
+package config
+
+import (
+	"bufio"
+	"fmt"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+func init() {
+	loadDotEnv()
+}
+
+func loadDotEnv() {
+	f, err := os.Open(".env")
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.Index(line, "=")
+		if idx < 1 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		value := strings.TrimSpace(line[idx+1:])
+		if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+			value = value[1 : len(value)-1]
+		}
+		if os.Getenv(key) == "" {
+			os.Setenv(key, value)
+		}
+	}
+}
+
+type Config struct {
+	DBSource           string
+	ServerAddress      string
+	JWTSecret          string
+	JWTAccessDuration  time.Duration
+	JWTRefreshDuration time.Duration
+	AllowedOrigins     []string
+	PaystackSecretKey  string
+	PaystackPublicKey  string
+	StorageLocalPath   string
+	RedisAddress       string
+	RedisPassword      string
+	SMTPHost           string
+	SMTPPort           int
+	SMTPUsername       string
+	SMTPPassword       string
+	SMTPFrom           string
+	SMTPMock           bool
+	PushMock           bool
+	VAPIDPublicKey     string
+	VAPIDPrivateKey    string
+	VAPIDSubject       string
+	Environment        string
+	GeminiApiKey       string
+	GeminiModel        string
+	AIFallbackEnabled  bool
+	FrontendPublicURL  string
+	// APIPublicURL is where the API is reachable from outside, for links in
+	// emails (department logos). It defaults to FRONTEND_PUBLIC_URL.
+	APIPublicURL string
+
+	// DefaultTenantSlug is the department used when a request names none
+	// (mobile clients, and web clients that predate tenants).
+	DefaultTenantSlug string
+	// DBMaxConnsPerTenant caps the connections each department may hold.
+	DBMaxConnsPerTenant int32
+	// DBAllowRLSBypass lets the server run as a role that bypasses row-level
+	// security (a superuser, BYPASSRLS, or a table owner). Local development
+	// only: with it set, departments are not isolated from one another.
+	DBAllowRLSBypass bool
+}
+
+func (c *Config) IsProduction() bool {
+	return c.Environment == "production"
+}
+
+func Load() *Config {
+	dbSource := getEnv("DB_SOURCE", "")
+	jwtSecret := getEnv("JWT_SECRET", "")
+
+	if dbSource == "" {
+		log.Fatal("DB_SOURCE environment variable is required. See .env.example for reference.")
+	}
+	if jwtSecret == "" {
+		log.Fatal("JWT_SECRET environment variable is required. See .env.example for reference.")
+	}
+	if len(jwtSecret) < 32 {
+		log.Fatal("JWT_SECRET must be at least 32 characters for security.")
+	}
+
+	if getEnv("ENVIRONMENT", "development") == "production" && getEnv("PAYSTACK_SECRET_KEY", "") == "" {
+		log.Fatal("PAYSTACK_SECRET_KEY environment variable is required in production. See .env.example for reference.")
+	}
+	if getEnv("ENVIRONMENT", "development") == "production" && getEnv("MANUAL_QR_SECRET", "") == "" {
+		log.Fatal("MANUAL_QR_SECRET environment variable is required in production. See .env.example for reference.")
+	}
+
+	return &Config{
+		DBSource:           dbSource,
+		ServerAddress:      getEnv("SERVER_ADDRESS", "0.0.0.0:8080"),
+		JWTSecret:          jwtSecret,
+		JWTAccessDuration:  getDuration("JWT_ACCESS_MINUTES", 60),
+		JWTRefreshDuration: getDuration("JWT_REFRESH_DAYS", 7*24*60),
+		AllowedOrigins:     getSlice("ALLOWED_ORIGINS", []string{"http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://localhost:5175", "https://aces-ivory.vercel.app"}), // comma-separated list in env; restrict to your domain(s) in production
+		PaystackSecretKey:  getEnv("PAYSTACK_SECRET_KEY", ""),
+		PaystackPublicKey:  getEnv("PAYSTACK_PUBLIC_KEY", ""),
+		StorageLocalPath:   getEnv("STORAGE_LOCAL_PATH", "./uploads"),
+		RedisAddress:       getEnv("REDIS_ADDRESS", "localhost:6379"),
+		RedisPassword:      getEnv("REDIS_PASSWORD", ""),
+		SMTPHost:           getEnv("SMTP_HOST", "localhost"),
+		SMTPPort:           getInt("SMTP_PORT", 1025),
+		SMTPUsername:       getEnv("SMTP_USERNAME", ""),
+		SMTPPassword:       getEnv("SMTP_PASSWORD", ""),
+		SMTPFrom:           getEnv("SMTP_FROM", "no-reply@aces.zone"),
+		SMTPMock:           getBool("SMTP_MOCK", true),
+		PushMock:           getBool("PUSH_MOCK", true),
+		VAPIDPublicKey:     getEnv("VAPID_PUBLIC_KEY", ""),
+		VAPIDPrivateKey:    getEnv("VAPID_PRIVATE_KEY", ""),
+		VAPIDSubject:       getEnv("VAPID_SUBJECT", "mailto:no-reply@aces.zone"),
+		Environment:        getEnv("ENVIRONMENT", "development"),
+		GeminiApiKey:       getEnv("GEMINI_API_KEY", ""),
+		GeminiModel:        getEnv("GEMINI_MODEL", "gemini-2.5-flash"),
+		AIFallbackEnabled:  getBool("AI_FALLBACK_ENABLED", true),
+		FrontendPublicURL:  getFirstEnv("FRONTEND_PUBLIC_URL", "http://localhost:5173"),
+		APIPublicURL:       getFirstEnv("API_PUBLIC_URL", getFirstEnv("FRONTEND_PUBLIC_URL", "http://localhost:5173")),
+
+		DefaultTenantSlug:   getEnv("DEFAULT_TENANT_SLUG", "uniuyo-ce"),
+		DBMaxConnsPerTenant: int32(getInt("DB_MAX_CONNS_PER_TENANT", 4)),
+		DBAllowRLSBypass:    getBool("DB_ALLOW_RLS_BYPASS", false),
+	}
+}
+
+func getEnv(key, fallback string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return fallback
+}
+
+func getDuration(key string, defaultMinutes int) time.Duration {
+	if val := os.Getenv(key); val != "" {
+		if mins, err := strconv.Atoi(val); err == nil {
+			return time.Duration(mins) * time.Minute
+		}
+	}
+	return time.Duration(defaultMinutes) * time.Minute
+}
+
+// getFirstEnv reads a single-URL config value, defensively taking only the
+// first entry if it was mistakenly configured as a comma-separated list (the
+// format used by list-valued vars like ALLOWED_ORIGINS) — a raw comma-joined
+// value here would otherwise get baked directly into things like Paystack
+// callback URLs, e.g. "http://a,http://b/payments/confirmation".
+func getFirstEnv(key, fallback string) string {
+	val := getEnv(key, fallback)
+	if idx := strings.Index(val, ","); idx >= 0 {
+		val = val[:idx]
+	}
+	return strings.TrimSpace(strings.TrimSuffix(val, "/"))
+}
+
+func getSlice(key string, fallback []string) []string {
+	if val := os.Getenv(key); val != "" {
+		parts := strings.Split(val, ",")
+		result := make([]string, 0, len(parts))
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				result = append(result, p)
+			}
+		}
+		if len(result) > 0 {
+			return result
+		}
+	}
+	return fallback
+}
+
+func (c *Config) DSN() string {
+	return fmt.Sprintf("%s", c.DBSource)
+}
+
+func getInt(key string, fallback int) int {
+	if val := os.Getenv(key); val != "" {
+		if i, err := strconv.Atoi(val); err == nil {
+			return i
+		}
+	}
+	return fallback
+}
+
+func getBool(key string, fallback bool) bool {
+	if val := os.Getenv(key); val != "" {
+		if b, err := strconv.ParseBool(val); err == nil {
+			return b
+		}
+	}
+	return fallback
+}

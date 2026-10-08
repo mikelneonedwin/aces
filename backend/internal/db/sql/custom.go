@@ -1,0 +1,2818 @@
+package db
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/shopspring/decimal"
+)
+
+func (q *Queries) GetDB() DBTX {
+	return q.db
+}
+
+// ==================== DUES RECEIPTS ====================
+
+// AssignReceiptNumber returns the payment's official receipt number,
+// allocating one from the per-type Postgres sequence the first time a
+// receipt is ever generated for this payment. Numbers are only consumed
+// when a receipt is actually issued (like tearing a page off a receipt
+// book), so failed/abandoned payments never burn numbers, and a payment
+// always keeps the same number no matter how many times its receipt is
+// re-downloaded.
+//
+// The counter name comes from the payment type: department dues and class
+// dues each have their own "receipt book" (department_receipt /
+// class_receipt) within the department. Anything else is rejected by the API layer before
+// reaching here, but we still fail closed with an error rather than
+// inventing a number.
+//
+// Two calls racing on the same payment are serialised by the row lock, so
+// exactly one receipt number is ever committed for a given payment.
+func (q *Queries) AssignReceiptNumber(ctx context.Context, paymentID uuid.UUID, paymentType PaymentType) (int32, error) {
+	var counter string
+	switch paymentType {
+	case PaymentTypeDeptDues:
+		counter = "department_receipt"
+	case PaymentTypeClassDues:
+		counter = "class_receipt"
+	default:
+		return 0, fmt.Errorf("receipts are only issued for department or class dues, not %q", paymentType)
+	}
+
+	// Numbers come from tenant_counters, so each department has its own
+	// receipt book. The payment row is locked before the counter moves, and the
+	// counter only moves when a number is really assigned: a second call for
+	// the same payment waits on the lock, then finds the number already set and
+	// takes none. (The old per-type sequences were consumed on every call.)
+	var n int32
+	err := q.db.QueryRow(ctx, `
+		WITH target AS (
+			SELECT id FROM payments WHERE id = $1 AND receipt_number IS NULL FOR UPDATE
+		),
+		next AS (
+			INSERT INTO tenant_counters (tenant_id, name, value)
+			SELECT app_current_tenant(), $2, 1 FROM target
+			ON CONFLICT (tenant_id, name) DO UPDATE SET value = tenant_counters.value + 1
+			RETURNING value
+		)
+		UPDATE payments p
+		SET receipt_number = next.value
+		FROM next
+		WHERE p.id = $1
+		RETURNING p.receipt_number
+	`, paymentID, counter).Scan(&n)
+	if err == nil {
+		return n, nil
+	}
+	if err != pgx.ErrNoRows {
+		return 0, err
+	}
+
+	// No row updated: either the number was already assigned, or the payment
+	// doesn't exist. Distinguish via a plain read.
+	var existing *int32
+	err = q.db.QueryRow(ctx, `SELECT receipt_number FROM payments WHERE id = $1`, paymentID).Scan(&existing)
+	if err != nil {
+		return 0, err
+	}
+	if existing == nil {
+		return 0, fmt.Errorf("payment %s has no receipt number after allocation race", paymentID)
+	}
+	return *existing, nil
+}
+
+// GetAttendanceSession is generated in attendance.sql.go — identical query.
+
+func (q *Queries) SumRegisteredCourseUnits(ctx context.Context, registrationID uuid.UUID) (int32, error) {
+	var total int32
+	err := q.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(c.unit), 0)::int
+		FROM registered_courses rc
+		JOIN courses c ON c.id = rc.course_id
+		WHERE rc.registration_id = $1
+	`, registrationID).Scan(&total)
+	return total, err
+}
+
+func (q *Queries) GetAssignmentGradeByID(ctx context.Context, id uuid.UUID) (AssignmentGrade, error) {
+	var i AssignmentGrade
+	err := q.db.QueryRow(ctx, `
+		SELECT id, assignment_id, student_id, score, feedback, is_late, graded_by, graded_at
+		FROM assignment_grades
+		WHERE id = $1
+	`, id).Scan(
+		&i.ID, &i.AssignmentID, &i.StudentID, &i.Score, &i.Feedback, &i.IsLate, &i.GradedBy, &i.GradedAt,
+	)
+	return i, err
+}
+
+type StudentAttendanceSummaryRow struct {
+	TotalClasses int32
+	Attended     int32
+}
+
+func (q *Queries) GetStudentAttendanceSummary(ctx context.Context, studentID, userID, semesterID uuid.UUID, semStart, semEnd time.Time) (StudentAttendanceSummaryRow, error) {
+	var i StudentAttendanceSummaryRow
+	err := q.db.QueryRow(ctx, `
+		WITH my_courses AS (
+			SELECT rc.course_id
+			FROM registered_courses rc
+			JOIN course_registrations cr ON cr.id = rc.registration_id
+			WHERE cr.student_id = $1 AND cr.semester_id = $3
+		),
+		my_sessions AS (
+			SELECT asess.id
+			FROM attendance_sessions asess
+			JOIN my_courses mc ON mc.course_id = asess.course_id
+			-- attendance_sessions.semester_id is never populated at session
+			-- creation time (always NULL in practice), so filtering on it here
+			-- silently zeroed out every student's count. Match by date range
+			-- against the semester instead, same as
+			-- GetStudentCourseAttendanceOverview already does correctly.
+			WHERE asess.created_at BETWEEN $4 AND $5 AND `+attendanceSessionCountedStatusesSQL+`
+		)
+		SELECT
+			(SELECT COUNT(*) FROM my_sessions)::int AS total_classes,
+			(SELECT COUNT(*) FROM attendance_checkins ac
+			 JOIN my_sessions ms ON ms.id = ac.session_id
+			 WHERE ac.student_id = $2 AND ac.present = true)::int AS attended
+	`, studentID, userID, semesterID, semStart, semEnd).Scan(&i.TotalClasses, &i.Attended)
+	return i, err
+}
+
+// UpdateUserEmailAndRole updates email and role fields of a user.
+func (q *Queries) UpdateUserEmailAndRole(ctx context.Context, id uuid.UUID, email string, role UserRole) (User, error) {
+	var i User
+	err := q.db.QueryRow(ctx, `
+		UPDATE users
+		SET email = $2, role = $3, updated_at = NOW()
+		WHERE id = $1
+		RETURNING id, email, password_hash, role, full_name, middle_name, phone, avatar_url, is_active, email_verified, two_factor_enabled, last_login_at, created_at, updated_at, deleted_at, created_by_hod_id, is_approved, approved_by, approved_at
+	`, id, strings.ToLower(strings.TrimSpace(email)), string(role)).Scan(
+		&i.ID, &i.Email, &i.PasswordHash, &i.Role, &i.FullName, &i.MiddleName, &i.Phone, &i.AvatarUrl,
+		&i.IsActive, &i.EmailVerified, &i.TwoFactorEnabled, &i.LastLoginAt,
+		&i.CreatedAt, &i.UpdatedAt, &i.DeletedAt, &i.CreatedByHodID,
+		&i.IsApproved, &i.ApprovedBy, &i.ApprovedAt,
+	)
+	return i, err
+}
+
+// UpdateUserMiddleName updates the middle_name field of a user.
+func (q *Queries) UpdateUserMiddleName(ctx context.Context, id uuid.UUID, middleName *string) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE users SET middle_name = $2, updated_at = NOW() WHERE id = $1
+	`, id, middleName)
+	return err
+}
+
+// UpdateStudentOnboardingFields updates additional student onboarding fields.
+func (q *Queries) UpdateStudentOnboardingFields(ctx context.Context, userID uuid.UUID, matricNumber, level, admissionMode, yearAdmitted, dateOfBirth, emergencyContactName, emergencyContactPhone, homeAddress *string, profilePhotoURL *string) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE students
+		SET
+			matric_number = COALESCE($2, matric_number),
+			level = COALESCE($3::int, level),
+			admission_mode = COALESCE($4, admission_mode),
+			year_admitted = COALESCE($5::int, year_admitted),
+			onboarding_completed = true
+		WHERE user_id = $1
+	`, userID,
+		derefStr(matricNumber),
+		derefStr(level),
+		derefStr(admissionMode),
+		derefStr(yearAdmitted),
+	)
+	return err
+}
+
+func derefStr(s *string) interface{} {
+	if s == nil {
+		return nil
+	}
+	v := strings.TrimSpace(*s)
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
+// UpdateUserPhoneAvatarBio updates phone, avatar_url fields for user.
+func (q *Queries) UpdateUserPhoneAvatarBio(ctx context.Context, id uuid.UUID, phone, avatarURL, bio *string) (User, error) {
+	var i User
+	err := q.db.QueryRow(ctx, `
+		UPDATE users
+		SET
+			phone = COALESCE($2, phone),
+			avatar_url = COALESCE($3, avatar_url),
+			updated_at = NOW()
+		WHERE id = $1
+		RETURNING id, email, password_hash, role, full_name, middle_name, phone, avatar_url, is_active, email_verified, two_factor_enabled, last_login_at, created_at, updated_at, deleted_at, created_by_hod_id, is_approved, approved_by, approved_at
+	`, id, phone, avatarURL).Scan(
+		&i.ID, &i.Email, &i.PasswordHash, &i.Role, &i.FullName, &i.MiddleName, &i.Phone, &i.AvatarUrl,
+		&i.IsActive, &i.EmailVerified, &i.TwoFactorEnabled, &i.LastLoginAt,
+		&i.CreatedAt, &i.UpdatedAt, &i.DeletedAt, &i.CreatedByHodID,
+		&i.IsApproved, &i.ApprovedBy, &i.ApprovedAt,
+	)
+	return i, err
+}
+
+// GetStudentByUserID fetches a student record by user_id, returns pgx.ErrNoRows if not found.
+func (q *Queries) GetStudentByUserIDFull(ctx context.Context, userID uuid.UUID) (Student, error) {
+	var i Student
+	err := q.db.QueryRow(ctx, `
+		SELECT id, user_id, matric_number, level, entry_year, current_session_id, current_semester,
+			cgpa, total_credits_earned, total_credits_required, academic_standing, graduation_status,
+			is_defaulter, defaulter_reason, created_at, updated_at, admission_mode, year_admitted, onboarding_completed
+		FROM students WHERE user_id = $1
+	`, userID).Scan(
+		&i.ID, &i.UserID, &i.MatricNumber, &i.Level, &i.EntryYear, &i.CurrentSessionID, &i.CurrentSemester,
+		&i.Cgpa, &i.TotalCreditsEarned, &i.TotalCreditsRequired, &i.AcademicStanding, &i.GraduationStatus,
+		&i.IsDefaulter, &i.DefaulterReason, &i.CreatedAt, &i.UpdatedAt, &i.AdmissionMode, &i.YearAdmitted, &i.OnboardingCompleted,
+	)
+	return i, err
+}
+
+// UserExtraFields holds the extra profile fields added via migration 000004.
+type UserExtraFields struct {
+	DateOfBirth           *string
+	EmergencyContactName  *string
+	EmergencyContactPhone *string
+	HomeAddress           *string
+}
+
+// GetUserExtraFields fetches date_of_birth, emergency_contact_name, emergency_contact_phone, home_address for a user.
+func (q *Queries) GetUserExtraFields(ctx context.Context, userID uuid.UUID) (UserExtraFields, error) {
+	var f UserExtraFields
+	err := q.db.QueryRow(ctx, `
+		SELECT date_of_birth::text, emergency_contact_name, emergency_contact_phone, home_address
+		FROM users WHERE id = $1
+	`, userID).Scan(
+		&f.DateOfBirth, &f.EmergencyContactName, &f.EmergencyContactPhone, &f.HomeAddress,
+	)
+	return f, err
+}
+
+// UpdateUserExtraFields updates the extra profile columns on the users table.
+func (q *Queries) UpdateUserExtraFields(ctx context.Context, userID uuid.UUID, dateOfBirth, emergencyContactName, emergencyContactPhone, homeAddress *string) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE users
+		SET
+			date_of_birth = COALESCE($2::date, date_of_birth),
+			emergency_contact_name = COALESCE($3, emergency_contact_name),
+			emergency_contact_phone = COALESCE($4, emergency_contact_phone),
+			home_address = COALESCE($5, home_address),
+			updated_at = NOW()
+		WHERE id = $1
+	`, userID,
+		derefStr(dateOfBirth),
+		derefStr(emergencyContactName),
+		derefStr(emergencyContactPhone),
+		derefStr(homeAddress),
+	)
+	return err
+}
+
+// UpdateStudentFieldsByAdmin updates student-specific fields by user_id.
+func (q *Queries) UpdateStudentFieldsByAdmin(ctx context.Context, userID uuid.UUID, matricNumber, level, admissionMode, yearAdmitted *string) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE students
+		SET
+			matric_number = COALESCE($2, matric_number),
+			level = COALESCE($3::int, level),
+			admission_mode = COALESCE($4, admission_mode),
+			year_admitted = COALESCE($5::int, year_admitted),
+			updated_at = NOW()
+		WHERE user_id = $1
+	`, userID,
+		derefStr(matricNumber),
+		derefStr(level),
+		derefStr(admissionMode),
+		derefStr(yearAdmitted),
+	)
+	return err
+}
+
+// UpdateStudentAcademicByHod updates academic fields by student_id with COALESCE.
+func (q *Queries) UpdateStudentAcademicByHod(ctx context.Context, studentID uuid.UUID, academicStanding, graduationStatus *string) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE students
+		SET
+			academic_standing = COALESCE($2::academic_standing, academic_standing),
+			graduation_status = COALESCE($3, graduation_status),
+			updated_at = NOW()
+		WHERE id = $1
+	`, studentID,
+		derefStr(academicStanding),
+		derefStr(graduationStatus),
+	)
+	return err
+}
+
+// DeleteUserHard permanently deletes a user and cascades to related records.
+func (q *Queries) DeleteUserHard(ctx context.Context, userID uuid.UUID) error {
+	// Dynamically nullify all FK columns referencing users(id) that lack ON DELETE CASCADE.
+	// This queries pg_constraint to find every such constraint at runtime.
+	doBlock := fmt.Sprintf(`
+		DO $$
+		DECLARE
+			r RECORD;
+		BEGIN
+			FOR r IN
+				SELECT conrelid::regclass::text AS tbl,
+					   a.attname AS col
+				FROM pg_constraint c
+				JOIN pg_attribute a
+				  ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+				WHERE c.confrelid = 'users'::regclass
+				  AND c.contype = 'f'
+				  AND pg_get_constraintdef(c.oid) NOT LIKE '%%ON DELETE CASCADE%%'
+			LOOP
+				EXECUTE format('UPDATE %%I SET %%I = NULL WHERE %%I = ''%s''', r.tbl, r.col, r.col);
+			END LOOP;
+		END;
+		$$;
+	`, userID)
+
+	_, _ = q.db.Exec(ctx, doBlock)
+
+	_, err := q.db.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
+	return err
+}
+
+// ListAllResults fetches all results with course code and student name joined.
+type ListAllResultsRow struct {
+	ID              uuid.UUID  `json:"id"`
+	StudentID       *uuid.UUID `json:"student_id"`
+	CourseID        uuid.UUID  `json:"course_id"`
+	SessionID       *uuid.UUID `json:"session_id"`
+	SemesterID      *uuid.UUID `json:"semester_id"`
+	CaScore         string     `json:"ca_score"`
+	ExamScore       string     `json:"exam_score"`
+	TotalScore      string     `json:"total_score"`
+	Grade           string     `json:"grade"`
+	GradePoint      float64    `json:"grade_point"`
+	Status          string     `json:"status"`
+	ApprovedBy      *uuid.UUID `json:"approved_by"`
+	RejectionReason *string    `json:"rejection_reason"`
+	IsCarryover     bool       `json:"is_carryover"`
+	CreatedAt       string     `json:"created_at"`
+	CourseCode      string     `json:"courseCode"`
+	CourseTitle     string     `json:"courseTitle"`
+	StudentName     string     `json:"studentName"`
+	MatricNumber    string     `json:"matric_number"`
+}
+
+func (q *Queries) ListAllResults(ctx context.Context, limit, offset int32) ([]ListAllResultsRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT r.id, r.student_id, r.course_id, r.session_id, r.semester_id,
+			r.ca_score::text, r.exam_score::text, r.total_score::text,
+			r.grade, r.grade_point, r.status, r.approved_by, r.rejection_reason,
+			r.is_carryover, r.created_at::text,
+			COALESCE(c.code, '') as course_code,
+			COALESCE(c.title, '') as course_title,
+			COALESCE(u.full_name, '') as student_name,
+			COALESCE(s.matric_number, r.matric_number, '') as matric_number
+		FROM results r
+		LEFT JOIN courses c ON c.id = r.course_id
+		LEFT JOIN students s ON s.id = r.student_id
+		LEFT JOIN users u ON u.id = s.user_id
+		ORDER BY r.created_at DESC
+		LIMIT $1 OFFSET $2
+	`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllResultsRow{}
+	for rows.Next() {
+		var i ListAllResultsRow
+		if err := rows.Scan(
+			&i.ID, &i.StudentID, &i.CourseID, &i.SessionID, &i.SemesterID,
+			&i.CaScore, &i.ExamScore, &i.TotalScore,
+			&i.Grade, &i.GradePoint, &i.Status, &i.ApprovedBy, &i.RejectionReason,
+			&i.IsCarryover, &i.CreatedAt,
+			&i.CourseCode, &i.CourseTitle, &i.StudentName, &i.MatricNumber,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// DeleteResult permanently removes a result record.
+// (Generated in results.sql.go — kept out of this file to avoid a duplicate
+// method declaration.)
+
+// ==================== LIST USERS WITH STUDENT DATA ====================
+
+type UserWithStudent struct {
+	ID               uuid.UUID  `json:"id"`
+	Email            string     `json:"email"`
+	FirstName        string     `json:"firstName"`
+	LastName         string     `json:"lastName"`
+	FullName         string     `json:"fullName"`
+	MiddleName       *string    `json:"middleName"`
+	Phone            *string    `json:"phone"`
+	AvatarUrl        *string    `json:"avatarUrl"`
+	Role             UserRole   `json:"role"`
+	IsActive         bool       `json:"isActive"`
+	IsApproved       bool       `json:"isApproved"`
+	CreatedAt        *string    `json:"createdAt"`
+	StudentID        *uuid.UUID `json:"studentId,omitempty"`
+	MatricNumber     *string    `json:"matricNumber,omitempty"`
+	Level            *int32     `json:"level,omitempty"`
+	Cgpa             *float64   `json:"cgpa,omitempty"`
+	AcademicStanding *string    `json:"academicStanding,omitempty"`
+	AllRoles         string     `json:"allRoles"`
+}
+
+func (q *Queries) ListUsersWithStudents(ctx context.Context, limit, offset int32, roleFilter string, search string) ([]UserWithStudent, error) {
+	where := "WHERE 1=1"
+	args := []interface{}{}
+	argIdx := 1
+
+	if roleFilter != "" {
+		where += fmt.Sprintf(" AND u.role = $%d", argIdx)
+		args = append(args, roleFilter)
+		argIdx++
+	}
+	if search != "" {
+		where += fmt.Sprintf(" AND (LOWER(u.full_name) LIKE $%d OR LOWER(u.email) LIKE $%d)", argIdx, argIdx)
+		args = append(args, "%"+strings.ToLower(search)+"%")
+		argIdx++
+	}
+
+	// Check if user_role_assignments table exists
+	var tableExists bool
+	err := q.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'user_role_assignments')`).Scan(&tableExists)
+	if err != nil {
+		tableExists = false
+	}
+
+	rolesSubquery := "u.role::text"
+	if tableExists {
+		rolesSubquery = `(SELECT COALESCE(string_agg(DISTINCT ura.role::text, ','), u.role::text) FROM user_role_assignments ura WHERE ura.user_id = u.id AND ura.is_active = true)`
+	}
+
+	query := fmt.Sprintf(`
+		SELECT u.id, u.email, u.first_name, u.last_name, u.full_name, u.middle_name, u.phone, u.avatar_url, u.role, u.is_active, u.is_approved, u.created_at::text,
+			s.id, s.matric_number, s.level, s.cgpa::text, s.academic_standing::text,
+			%s as all_roles
+		FROM users u
+		LEFT JOIN students s ON s.user_id = u.id
+		%s
+		ORDER BY u.created_at DESC
+		LIMIT $%d OFFSET $%d
+	`, rolesSubquery, where, argIdx, argIdx+1)
+	args = append(args, limit, offset)
+
+	rows, err := q.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := []UserWithStudent{}
+	for rows.Next() {
+		var i UserWithStudent
+		var cgpaStr, academicStandingStr *string
+		if err := rows.Scan(
+			&i.ID, &i.Email, &i.FirstName, &i.LastName, &i.FullName, &i.MiddleName, &i.Phone, &i.AvatarUrl, &i.Role, &i.IsActive, &i.IsApproved, &i.CreatedAt,
+			&i.StudentID, &i.MatricNumber, &i.Level, &cgpaStr, &academicStandingStr, &i.AllRoles,
+		); err != nil {
+			return nil, err
+		}
+		if cgpaStr != nil {
+			if v, err := strconv.ParseFloat(*cgpaStr, 64); err == nil {
+				i.Cgpa = &v
+			}
+		}
+		i.AcademicStanding = academicStandingStr
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// ==================== BACKUPS ====================
+
+type BackupListItem struct {
+	ID        uuid.UUID  `json:"id"`
+	FileName  string     `json:"file_name"`
+	S3Url     string     `json:"s3_url"`
+	SizeMb    *string    `json:"size_mb"`
+	Status    string     `json:"status"`
+	CreatedBy *uuid.UUID `json:"created_by"`
+	CreatedAt string     `json:"created_at"`
+}
+
+func (q *Queries) ListBackups(ctx context.Context) ([]BackupListItem, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT id, file_name, s3_url, size_mb::text, status::text, created_by, created_at::text
+		FROM backups
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BackupListItem{}
+	for rows.Next() {
+		var i BackupListItem
+		if err := rows.Scan(
+			&i.ID, &i.FileName, &i.S3Url, &i.SizeMb, &i.Status, &i.CreatedBy, &i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (q *Queries) CreateBackup(ctx context.Context, fileName, s3URL string, createdBy uuid.UUID) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := q.db.QueryRow(ctx, `
+		INSERT INTO backups (file_name, s3_url, status, size_mb, created_by)
+		SELECT $1, $2, 'completed',
+		       ROUND(pg_database_size(current_database()) / 1048576.0, 2),
+		       $3
+		RETURNING id
+	`, fileName, s3URL, createdBy).Scan(&id)
+	return id, err
+}
+
+func (q *Queries) GetBackup(ctx context.Context, id uuid.UUID) (BackupListItem, error) {
+	var i BackupListItem
+	err := q.db.QueryRow(ctx, `
+		SELECT id, file_name, s3_url, size_mb::text, status::text, created_by, created_at::text
+		FROM backups
+		WHERE id = $1
+	`, id).Scan(
+		&i.ID, &i.FileName, &i.S3Url, &i.SizeMb, &i.Status, &i.CreatedBy, &i.CreatedAt,
+	)
+	return i, err
+}
+
+func (q *Queries) UpdateBackupStatus(ctx context.Context, id uuid.UUID, status string) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE backups SET status = $2 WHERE id = $1
+	`, id, status)
+	return err
+}
+
+// ==================== LECTURER MANAGEMENT ====================
+
+type LecturerProfile struct {
+	ID               uuid.UUID  `json:"id"`
+	UserID           uuid.UUID  `json:"user_id"`
+	StaffID          string     `json:"staff_id"`
+	Department       string     `json:"department"`
+	Title            *string    `json:"title"`
+	FirstName        *string    `json:"first_name"`
+	LastName         *string    `json:"last_name"`
+	FullName         string     `json:"full_name"`
+	Email            string     `json:"email"`
+	Phone            *string    `json:"phone"`
+	AvatarURL        *string    `json:"avatar_url"`
+	Rank             *string    `json:"rank"`
+	Specialization   *string    `json:"specialization"`
+	EmploymentType   *string    `json:"employment_type"`
+	EmploymentStatus *string    `json:"employment_status"`
+	Qualifications   []byte     `json:"qualifications"`
+	Bio              *string    `json:"bio"`
+	OfficeLocation   *string    `json:"office_location"`
+	OfficeHours      []byte     `json:"office_hours"`
+	DateJoined       *time.Time `json:"date_joined"`
+	CreatedAt        *time.Time `json:"created_at"`
+}
+
+func (q *Queries) ListLecturers(ctx context.Context) ([]LecturerProfile, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT s.id, s.user_id, s.staff_id, s.department, s.title, s.first_name, s.last_name,
+		       u.full_name, u.email, u.phone, u.avatar_url,
+		       s.rank, s.specialization, s.employment_type, s.employment_status,
+		       COALESCE(s.qualifications, '[]'::jsonb), s.bio, s.office_location,
+		       COALESCE(s.office_hours, '{}'::jsonb), s.date_joined, s.created_at
+		FROM staff s
+		JOIN users u ON u.id = s.user_id
+		WHERE u.role = 'lecturer' AND u.is_active = true AND u.deleted_at IS NULL
+		ORDER BY u.full_name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LecturerProfile{}
+	for rows.Next() {
+		var i LecturerProfile
+		if err := rows.Scan(
+			&i.ID, &i.UserID, &i.StaffID, &i.Department, &i.Title, &i.FirstName, &i.LastName,
+			&i.FullName, &i.Email, &i.Phone, &i.AvatarURL,
+			&i.Rank, &i.Specialization, &i.EmploymentType, &i.EmploymentStatus,
+			&i.Qualifications, &i.Bio, &i.OfficeLocation,
+			&i.OfficeHours, &i.DateJoined, &i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	return items, rows.Err()
+}
+
+func (q *Queries) GetLecturerProfileByUserID(ctx context.Context, userID uuid.UUID) (LecturerProfile, error) {
+	var i LecturerProfile
+	err := q.db.QueryRow(ctx, `
+		SELECT s.id, s.user_id, s.staff_id, s.department, s.title, s.first_name, s.last_name,
+		       u.full_name, u.email, u.phone, u.avatar_url,
+		       s.rank, s.specialization, s.employment_type, s.employment_status,
+		       COALESCE(s.qualifications, '[]'::jsonb), s.bio, s.office_location,
+		       COALESCE(s.office_hours, '{}'::jsonb), s.date_joined, s.created_at
+		FROM staff s
+		JOIN users u ON u.id = s.user_id
+		WHERE s.user_id = $1
+	`, userID).Scan(
+		&i.ID, &i.UserID, &i.StaffID, &i.Department, &i.Title, &i.FirstName, &i.LastName,
+		&i.FullName, &i.Email, &i.Phone, &i.AvatarURL,
+		&i.Rank, &i.Specialization, &i.EmploymentType, &i.EmploymentStatus,
+		&i.Qualifications, &i.Bio, &i.OfficeLocation,
+		&i.OfficeHours, &i.DateJoined, &i.CreatedAt,
+	)
+	return i, err
+}
+
+type UpdateLecturerProfileParams struct {
+	StaffID        string
+	Title          *string
+	FirstName      *string
+	LastName       *string
+	Rank           *string
+	Specialization *string
+	Bio            *string
+	OfficeLocation *string
+	OfficeHours    *string
+}
+
+func (q *Queries) UpdateLecturerProfile(ctx context.Context, userID uuid.UUID, arg UpdateLecturerProfileParams) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE staff SET
+			title = COALESCE($2, title),
+			first_name = COALESCE($3, first_name),
+			last_name = COALESCE($4, last_name),
+			rank = COALESCE($5, rank),
+			specialization = COALESCE($6, specialization),
+			bio = COALESCE($7, bio),
+			office_location = COALESCE($8, office_location),
+			office_hours = COALESCE($9::jsonb, office_hours),
+			updated_at = NOW()
+		WHERE user_id = $1
+	`, userID, arg.Title, arg.FirstName, arg.LastName, arg.Rank, arg.Specialization, arg.Bio, arg.OfficeLocation, arg.OfficeHours)
+	return err
+}
+
+type LecturerCourseAssignmentRow struct {
+	ID             uuid.UUID    `json:"id"`
+	LecturerID     uuid.UUID    `json:"lecturer_id"`
+	CourseID       uuid.UUID    `json:"course_id"`
+	CourseCode     string       `json:"course_code"`
+	CourseTitle    string       `json:"course_title"`
+	CourseUnit     int32        `json:"course_unit"`
+	Level          int32        `json:"level"`
+	SessionID      uuid.UUID    `json:"session_id"`
+	Semester       string       `json:"semester"`
+	IsPrimary      bool         `json:"is_primary"`
+	AssignedBy     uuid.UUID    `json:"assigned_by"`
+	AssignedByName string       `json:"assigned_by_name"`
+	CreatedAt      sql.NullTime `json:"created_at"`
+}
+
+func (q *Queries) ListLecturerAssignments(ctx context.Context, lecturerID uuid.UUID) ([]LecturerCourseAssignmentRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT lca.id, lca.lecturer_id, lca.course_id, c.code, c.title, c.unit, c.level,
+		       lca.session_id, lca.semester, lca.is_primary, lca.assigned_by,
+		       u.full_name, lca.created_at
+		FROM lecturer_course_assignments lca
+		JOIN courses c ON c.id = lca.course_id
+		JOIN users u ON u.id = lca.assigned_by
+		WHERE lca.lecturer_id = $1
+		ORDER BY c.level, c.code
+	`, lecturerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LecturerCourseAssignmentRow{}
+	for rows.Next() {
+		var i LecturerCourseAssignmentRow
+		if err := rows.Scan(
+			&i.ID, &i.LecturerID, &i.CourseID, &i.CourseCode, &i.CourseTitle, &i.CourseUnit, &i.Level,
+			&i.SessionID, &i.Semester, &i.IsPrimary, &i.AssignedBy,
+			&i.AssignedByName, &i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	return items, rows.Err()
+}
+
+type AssignCourseToLecturerParams struct {
+	LecturerID uuid.UUID
+	CourseID   uuid.UUID
+	SessionID  uuid.UUID
+	Semester   string
+	AssignedBy uuid.UUID
+	IsPrimary  bool
+}
+
+func (q *Queries) AssignCourseToLecturer(ctx context.Context, arg AssignCourseToLecturerParams) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := q.db.QueryRow(ctx, `
+		INSERT INTO lecturer_course_assignments (lecturer_id, course_id, session_id, semester, assigned_by, is_primary)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (tenant_id, course_id, session_id, semester) DO UPDATE
+		SET lecturer_id = EXCLUDED.lecturer_id, is_primary = EXCLUDED.is_primary, assigned_by = EXCLUDED.assigned_by, updated_at = NOW()
+		RETURNING id
+	`, arg.LecturerID, arg.CourseID, arg.SessionID, arg.Semester, arg.AssignedBy, arg.IsPrimary).Scan(&id)
+	return id, err
+}
+
+func (q *Queries) RemoveCourseAssignment(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, `DELETE FROM lecturer_course_assignments WHERE id = $1`, id)
+	return err
+}
+
+func (q *Queries) GetLecturerWorkload(ctx context.Context, lecturerID uuid.UUID, sessionID uuid.UUID) (int32, error) {
+	var total int32
+	err := q.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(c.unit), 0)::int
+		FROM lecturer_course_assignments lca
+		JOIN courses c ON c.id = lca.course_id
+		WHERE lca.lecturer_id = $1 AND lca.session_id = $2
+	`, lecturerID, sessionID).Scan(&total)
+	return total, err
+}
+type CreateLeaveRequestParams struct {
+	LecturerID     uuid.UUID
+	LeaveType      string
+	StartDate      string
+	EndDate        string
+	Reason         string
+	CourseHandover string
+}
+
+type LecturerLeaveRow struct {
+	ID             uuid.UUID    `json:"id"`
+	LecturerID     uuid.UUID    `json:"lecturer_id"`
+	LecturerName   string       `json:"lecturer_name"`
+	LeaveType      string       `json:"leave_type"`
+	StartDate      string       `json:"start_date"`
+	EndDate        string       `json:"end_date"`
+	Reason         string       `json:"reason"`
+	CourseHandover []byte       `json:"course_handover"`
+	Status         string       `json:"status"`
+	ApprovedBy     *uuid.UUID   `json:"approved_by"`
+	ApprovedAt     sql.NullTime `json:"approved_at"`
+	CreatedAt      sql.NullTime `json:"created_at"`
+}
+
+func (q *Queries) CreateLeaveRequest(ctx context.Context, arg CreateLeaveRequestParams) (LecturerLeaveRow, error) {
+	var i LecturerLeaveRow
+	err := q.db.QueryRow(ctx, `
+		INSERT INTO lecturer_leave (lecturer_id, leave_type, start_date, end_date, reason, course_handover)
+		VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+		RETURNING id, lecturer_id, leave_type, start_date::text, end_date::text, reason, course_handover, status, approved_by, approved_at, created_at
+	`, arg.LecturerID, arg.LeaveType, arg.StartDate, arg.EndDate, arg.Reason, arg.CourseHandover).Scan(
+		&i.ID, &i.LecturerID, &i.LeaveType, &i.StartDate, &i.EndDate, &i.Reason, &i.CourseHandover,
+		&i.Status, &i.ApprovedBy, &i.ApprovedAt, &i.CreatedAt,
+	)
+	if err == nil {
+		i.LecturerName = ""
+	}
+	return i, err
+}
+
+func (q *Queries) ListLeaveRequests(ctx context.Context, lecturerID uuid.UUID) ([]LecturerLeaveRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT ll.id, ll.lecturer_id, u.full_name, ll.leave_type, ll.start_date::text, ll.end_date::text,
+		       ll.reason, COALESCE(ll.course_handover, '{}'::jsonb), ll.status, ll.approved_by, ll.approved_at, ll.created_at
+		FROM lecturer_leave ll
+		JOIN users u ON u.id = ll.lecturer_id
+		WHERE ll.lecturer_id = $1
+		ORDER BY ll.created_at DESC
+	`, lecturerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LecturerLeaveRow{}
+	for rows.Next() {
+		var i LecturerLeaveRow
+		if err := rows.Scan(
+			&i.ID, &i.LecturerID, &i.LecturerName, &i.LeaveType, &i.StartDate, &i.EndDate,
+			&i.Reason, &i.CourseHandover, &i.Status, &i.ApprovedBy, &i.ApprovedAt, &i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	return items, rows.Err()
+}
+
+func (q *Queries) ListAllLeaveRequests(ctx context.Context) ([]LecturerLeaveRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT ll.id, ll.lecturer_id, u.full_name, ll.leave_type, ll.start_date::text, ll.end_date::text,
+		       ll.reason, COALESCE(ll.course_handover, '{}'::jsonb), ll.status, ll.approved_by, ll.approved_at, ll.created_at
+		FROM lecturer_leave ll
+		JOIN users u ON u.id = ll.lecturer_id
+		ORDER BY ll.created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []LecturerLeaveRow{}
+	for rows.Next() {
+		var i LecturerLeaveRow
+		if err := rows.Scan(
+			&i.ID, &i.LecturerID, &i.LecturerName, &i.LeaveType, &i.StartDate, &i.EndDate,
+			&i.Reason, &i.CourseHandover, &i.Status, &i.ApprovedBy, &i.ApprovedAt, &i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	return items, rows.Err()
+}
+
+func (q *Queries) UpdateLeaveStatus(ctx context.Context, id uuid.UUID, status string, approvedBy uuid.UUID) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE lecturer_leave
+		SET status = $2::leave_status, approved_by = $3, approved_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE approved_at END, updated_at = NOW()
+		WHERE id = $1
+	`, id, status, approvedBy)
+	return err
+}
+
+// ==================== BURSAR DASHBOARD ====================
+
+type BursarDashboardStats struct {
+	TotalRevenue         float64 `json:"total_revenue"`
+	TotalCollected       float64 `json:"total_collected"`
+	TotalOutstanding     float64 `json:"total_outstanding"`
+	TodayCollection      float64 `json:"today_collection"`
+	TodayTransactions    int     `json:"today_transactions"`
+	PendingVerifications int     `json:"pending_verifications"`
+	TotalStudents        int     `json:"total_students"`
+	FullyPaidStudents    int     `json:"fully_paid_students"`
+	UnpaidStudents       int     `json:"unpaid_students"`
+}
+
+func (q *Queries) GetBursarDashboardStats(ctx context.Context) (BursarDashboardStats, error) {
+	var s BursarDashboardStats
+
+	// Revenue is what's owed across all students, not the due line-items
+	// themselves — summing dues.amount alone (as this used to) ignores
+	// student count entirely and is off by orders of magnitude. Mirrors the
+	// per-student cross join ListDefaultersByLevel already uses correctly,
+	// including the same level-scoping (a level-specific due only counts for
+	// students at that level; a NULL-level due applies department-wide).
+	_ = q.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(d.amount), 0)
+		FROM students s
+		CROSS JOIN dues d
+		WHERE d.is_active = true AND (d.level IS NULL OR d.level = s.level)
+	`).Scan(&s.TotalRevenue)
+
+	_ = q.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.status = 'completed'
+	`).Scan(&s.TotalCollected)
+
+	s.TotalOutstanding = s.TotalRevenue - s.TotalCollected
+	if s.TotalOutstanding < 0 {
+		s.TotalOutstanding = 0
+	}
+
+	_ = q.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(p.amount), 0), COUNT(*)::int
+		FROM payments p
+		WHERE p.status = 'completed' AND p.created_at::date = CURRENT_DATE
+	`).Scan(&s.TodayCollection, &s.TodayTransactions)
+
+	_ = q.db.QueryRow(ctx, `
+		SELECT COUNT(*)::int FROM payments WHERE status = 'pending'
+	`).Scan(&s.PendingVerifications)
+
+	_ = q.db.QueryRow(ctx, `SELECT COUNT(*)::int FROM students`).Scan(&s.TotalStudents)
+
+	return s, nil
+}
+
+type PendingPaymentRow struct {
+	ID                uuid.UUID          `json:"id"`
+	StudentID         uuid.UUID          `json:"student_id"`
+	StudentName       string             `json:"student_name"`
+	MatricNumber      string             `json:"matric_number"`
+	Level             int32              `json:"level"`
+	DueID             uuid.UUID          `json:"due_id"`
+	DueName           string             `json:"due_name"`
+	Amount            float64            `json:"amount"`
+	PaystackReference sql.NullString     `json:"paystack_reference"`
+	PaymentMethod     string             `json:"payment_method"`
+	BankReference     sql.NullString     `json:"bank_reference"`
+	BankName          sql.NullString     `json:"bank_name"`
+	Status            string             `json:"status"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ListPendingPayments(ctx context.Context, limit int32) ([]PendingPaymentRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT p.id, p.student_id, u.full_name, s.matric_number, s.level,
+		       p.due_id, d.name, p.amount, p.paystack_reference,
+		       COALESCE(p.payment_method, 'paystack'), p.bank_reference, p.bank_name,
+		       p.status, p.created_at
+		FROM payments p
+		JOIN students st ON st.id = p.student_id
+		JOIN users u ON u.id = st.user_id
+		JOIN dues d ON d.id = p.due_id
+		JOIN students s ON s.id = p.student_id
+		WHERE p.status = 'pending'
+		ORDER BY p.created_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PendingPaymentRow{}
+	for rows.Next() {
+		var i PendingPaymentRow
+		if err := rows.Scan(
+			&i.ID, &i.StudentID, &i.StudentName, &i.MatricNumber, &i.Level,
+			&i.DueID, &i.DueName, &i.Amount, &i.PaystackReference,
+			&i.PaymentMethod, &i.BankReference, &i.BankName,
+			&i.Status, &i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	return items, rows.Err()
+}
+
+type RecentPaymentRow struct {
+	ID                uuid.UUID          `json:"id"`
+	StudentName       string             `json:"student_name"`
+	MatricNumber      string             `json:"matric_number"`
+	DueName           string             `json:"due_name"`
+	Amount            float64            `json:"amount"`
+	PaystackReference sql.NullString     `json:"paystack_reference"`
+	PaymentMethod     string             `json:"payment_method"`
+	Status            string             `json:"status"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ListRecentPayments(ctx context.Context, limit int32) ([]RecentPaymentRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT p.id, u.full_name, s.matric_number, d.name, p.amount,
+		       p.paystack_reference, COALESCE(p.payment_method, 'paystack'), p.status, p.created_at
+		FROM payments p
+		JOIN students st ON st.id = p.student_id
+		JOIN users u ON u.id = st.user_id
+		JOIN students s ON s.id = p.student_id
+		JOIN dues d ON d.id = p.due_id
+		WHERE p.status = 'completed'
+		ORDER BY p.created_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RecentPaymentRow{}
+	for rows.Next() {
+		var i RecentPaymentRow
+		if err := rows.Scan(
+			&i.ID, &i.StudentName, &i.MatricNumber, &i.DueName, &i.Amount,
+			&i.PaystackReference, &i.PaymentMethod, &i.Status, &i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	return items, rows.Err()
+}
+
+// ─── Universal Subcategories ──────────────────────────────────────────
+
+type SubcategoryItem struct {
+	ID          uuid.UUID    `json:"id"`
+	Module      string       `json:"module"`
+	Name        string       `json:"name"`
+	Description *string      `json:"description"`
+	Color       *string      `json:"color"`
+	SortOrder   int32        `json:"sort_order"`
+	IsActive    bool         `json:"is_active"`
+	CreatedAt   sql.NullTime `json:"created_at"`
+	UpdatedAt   sql.NullTime `json:"updated_at"`
+}
+
+func (q *Queries) ListSubcategories(ctx context.Context, module string) ([]SubcategoryItem, error) {
+	var rows_data []SubcategoryItem
+	rows, err := q.db.Query(ctx, `
+		SELECT id, module::text, name, description, color, sort_order, is_active, created_at, updated_at
+		FROM subcategories
+		WHERE ($1 = '' OR module::text = $1)
+		ORDER BY sort_order, name
+	`, module)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var i SubcategoryItem
+		if err := rows.Scan(&i.ID, &i.Module, &i.Name, &i.Description, &i.Color, &i.SortOrder, &i.IsActive, &i.CreatedAt, &i.UpdatedAt); err != nil {
+			return nil, err
+		}
+		rows_data = append(rows_data, i)
+	}
+	return rows_data, rows.Err()
+}
+
+func (q *Queries) CreateSubcategory(ctx context.Context, module string, name string, description *string, color *string, sortOrder int32) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := q.db.QueryRow(ctx, `
+		INSERT INTO subcategories (module, name, description, color, sort_order)
+		VALUES ($1::subcategory_module, $2, $3, $4, $5)
+		RETURNING id
+	`, module, name, description, color, sortOrder).Scan(&id)
+	return id, err
+}
+
+func (q *Queries) UpdateSubcategory(ctx context.Context, id uuid.UUID, name *string, description *string, color *string, sortOrder *int32, isActive *bool) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE subcategories SET
+			name = COALESCE($2, name),
+			description = COALESCE($3, description),
+			color = COALESCE($4, color),
+			sort_order = COALESCE($5, sort_order),
+			is_active = COALESCE($6, is_active),
+			updated_at = NOW()
+		WHERE id = $1
+	`, id, name, description, color, sortOrder, isActive)
+	return err
+}
+
+func (q *Queries) DeleteSubcategory(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, `DELETE FROM subcategories WHERE id = $1`, id)
+	return err
+}
+
+func (q *Queries) ReorderSubcategories(ctx context.Context, module string, ids []uuid.UUID) error {
+	for idx, id := range ids {
+		_, err := q.db.Exec(ctx, `
+			UPDATE subcategories SET sort_order = $1, updated_at = NOW()
+			WHERE id = $2 AND module::text = $3
+		`, int32(idx), id, module)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ─── Analytics Aggregation ────────────────────────────────────────────
+
+type AnalyticsEnrollment struct {
+	Level string `json:"level"`
+	Count int32  `json:"count"`
+}
+
+type AnalyticsRevenue struct {
+	Month  string  `json:"month"`
+	Amount float64 `json:"amount"`
+}
+
+type AnalyticsAttendance struct {
+	Date string  `json:"date"`
+	Rate float64 `json:"rate"`
+}
+
+type AnalyticsCGPADistribution struct {
+	Range string `json:"range"`
+	Count int32  `json:"count"`
+}
+
+type AnalyticsOverview struct {
+	TotalStudents      int32                       `json:"total_students"`
+	TotalCourses       int32                       `json:"total_courses"`
+	TotalComplaints    int32                       `json:"total_complaints"`
+	OpenComplaints     int32                       `json:"open_complaints"`
+	TotalPayments      int32                       `json:"total_payments"`
+	TotalRevenue       float64                     `json:"total_revenue"`
+	PendingPayments    int32                       `json:"pending_payments"`
+	TotalResults       int32                       `json:"total_results"`
+	TotalBackups       int32                       `json:"total_backups"`
+	ActiveUsers        int32                       `json:"active_users"`
+	EnrollmentByLevel  []AnalyticsEnrollment       `json:"enrollment_by_level"`
+	CGPADistribution   []AnalyticsCGPADistribution `json:"cgpa_distribution"`
+	ComplaintsByStatus []struct {
+		Status string `json:"status"`
+		Count  int32  `json:"count"`
+	} `json:"complaints_by_status"`
+}
+
+func (q *Queries) GetAnalyticsOverview(ctx context.Context) (*AnalyticsOverview, error) {
+	var overview AnalyticsOverview
+
+	q.db.QueryRow(ctx, `SELECT COUNT(*) FROM students`).Scan(&overview.TotalStudents)
+	q.db.QueryRow(ctx, `SELECT COUNT(*) FROM courses`).Scan(&overview.TotalCourses)
+	q.db.QueryRow(ctx, `SELECT COUNT(*) FROM complaints`).Scan(&overview.TotalComplaints)
+	q.db.QueryRow(ctx, `SELECT COUNT(*) FROM complaints WHERE status IN ('open','in_review')`).Scan(&overview.OpenComplaints)
+	q.db.QueryRow(ctx, `SELECT COUNT(*) FROM payments`).Scan(&overview.TotalPayments)
+	// payment_status only has pending/completed/failed/refunded — 'verified'
+	// isn't a member, so this silently failed (Scan's error return was never
+	// checked) and TotalRevenue stayed at Go's zero-value forever.
+	q.db.QueryRow(ctx, `SELECT COALESCE(SUM(amount), 0) FROM payments WHERE status = 'completed'`).Scan(&overview.TotalRevenue)
+	q.db.QueryRow(ctx, `SELECT COUNT(*) FROM payments WHERE status = 'pending'`).Scan(&overview.PendingPayments)
+	q.db.QueryRow(ctx, `SELECT COUNT(*) FROM results`).Scan(&overview.TotalResults)
+	q.db.QueryRow(ctx, `SELECT COUNT(*) FROM backups`).Scan(&overview.TotalBackups)
+	q.db.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE is_active = true`).Scan(&overview.ActiveUsers)
+
+	rows, err := q.db.Query(ctx, `
+		SELECT COALESCE(level::text, 'Unknown') as level, COUNT(*) as cnt
+		FROM students GROUP BY level ORDER BY level
+	`)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var e AnalyticsEnrollment
+			rows.Scan(&e.Level, &e.Count)
+			overview.EnrollmentByLevel = append(overview.EnrollmentByLevel, e)
+		}
+	}
+
+	rows2, err := q.db.Query(ctx, `
+		SELECT CASE
+			WHEN cgpa >= 3.5 THEN '3.5-4.0'
+			WHEN cgpa >= 3.0 THEN '3.0-3.49'
+			WHEN cgpa >= 2.5 THEN '2.5-2.99'
+			WHEN cgpa >= 2.0 THEN '2.0-2.49'
+			WHEN cgpa >= 1.5 THEN '1.5-1.99'
+			WHEN cgpa >= 1.0 THEN '1.0-1.49'
+			WHEN cgpa >= 0 THEN '0.0-0.99'
+			ELSE 'N/A'
+		END as range, COUNT(*) as cnt
+		FROM students GROUP BY range ORDER BY range
+	`)
+	if err == nil {
+		defer rows2.Close()
+		for rows2.Next() {
+			var d AnalyticsCGPADistribution
+			rows2.Scan(&d.Range, &d.Count)
+			overview.CGPADistribution = append(overview.CGPADistribution, d)
+		}
+	}
+
+	rows3, err := q.db.Query(ctx, `
+		SELECT status::text, COUNT(*) FROM complaints GROUP BY status
+	`)
+	if err == nil {
+		defer rows3.Close()
+		for rows3.Next() {
+			var s struct {
+				Status string `json:"status"`
+				Count  int32  `json:"count"`
+			}
+			rows3.Scan(&s.Status, &s.Count)
+			overview.ComplaintsByStatus = append(overview.ComplaintsByStatus, s)
+		}
+	}
+
+	return &overview, nil
+}
+
+func (q *Queries) GetAnalyticsTrend(ctx context.Context, days int32) ([]AnalyticsEnrollment, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT to_char(d::date, 'YYYY-MM-DD') AS level,
+		       COALESCE(cnt, 0) AS cnt
+		FROM generate_series(CURRENT_DATE - ($1::int || ' days')::interval,
+		                     CURRENT_DATE, '1 day') d
+		LEFT JOIN (
+			SELECT date(paid_at) AS day, COUNT(*) AS cnt
+			FROM payments
+			WHERE status = 'completed'
+			  AND paid_at >= CURRENT_DATE - ($1::int || ' days')::interval
+			GROUP BY day
+		) pay ON pay.day = d::date
+		ORDER BY d
+	`, days)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AnalyticsEnrollment
+	for rows.Next() {
+		var e AnalyticsEnrollment
+		rows.Scan(&e.Level, &e.Count)
+		items = append(items, e)
+	}
+	return items, nil
+}
+
+// ─── Backup Enhancements ──────────────────────────────────────────────
+
+type BackupSummary struct {
+	TotalBackups   int32   `json:"total_backups"`
+	CompletedCount int32   `json:"completed_count"`
+	FailedCount    int32   `json:"failed_count"`
+	TotalSizeMB    float64 `json:"total_size_mb"`
+}
+
+func (q *Queries) GetBackupSummary(ctx context.Context) (*BackupSummary, error) {
+	var s BackupSummary
+	err := q.db.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE status = 'completed'),
+		       COUNT(*) FILTER (WHERE status = 'failed'),
+		       COALESCE(SUM(size_mb), 0)
+		FROM backups
+	`).Scan(&s.TotalBackups, &s.CompletedCount, &s.FailedCount, &s.TotalSizeMB)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (q *Queries) GetBackupByID(ctx context.Context, id uuid.UUID) (*BackupListItem, error) {
+	var i BackupListItem
+	err := q.db.QueryRow(ctx, `
+		SELECT id, file_name, s3_url, COALESCE(size_mb::text, '0'), status::text, created_by, created_at::text
+		FROM backups WHERE id = $1
+	`, id).Scan(&i.ID, &i.FileName, &i.S3Url, &i.SizeMb, &i.Status, &i.CreatedBy, &i.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &i, nil
+}
+
+// ─── Alumni queries ────────────────────────────────────────────────────
+
+type AlumniStatusFull struct {
+	ID                   interface{} `json:"id"`
+	UserID               interface{} `json:"user_id"`
+	GraduationYear       interface{} `json:"graduation_year"`
+	GraduationClass      interface{} `json:"graduation_class"`
+	VerificationStatus   interface{} `json:"verification_status"`
+	VerifiedBy           interface{} `json:"verified_by"`
+	VerifiedAt           interface{} `json:"verified_at"`
+	IsMentorAvailable    bool        `json:"is_mentor_available"`
+	MentorSpecialization interface{} `json:"mentor_specialization"`
+	CurrentCompany       interface{} `json:"current_company"`
+	CurrentPosition      interface{} `json:"current_position"`
+	LinkedInURL          interface{} `json:"linkedin_url"`
+	Bio                  interface{} `json:"bio"`
+	CreatedAt            interface{} `json:"created_at"`
+	UpdatedAt            interface{} `json:"updated_at"`
+	Location             interface{} `json:"location"`
+	PortfolioURL         interface{} `json:"portfolio_url"`
+	PrivacyLevel         interface{} `json:"privacy_level"`
+	MentorshipTopics     interface{} `json:"mentorship_topics"`
+	Skills               interface{} `json:"skills"`
+	WillingToSpeak       interface{} `json:"willing_to_speak"`
+	Industry             interface{} `json:"industry"`
+	FullName             interface{} `json:"full_name"`
+	Email                interface{} `json:"email"`
+	AvatarURL            interface{} `json:"avatar_url"`
+}
+
+func (q *Queries) GetMyAlumniStatus(ctx context.Context, userID uuid.UUID) (*AlumniStatusFull, error) {
+	var s AlumniStatusFull
+	err := q.db.QueryRow(ctx, `
+		SELECT a.id, a.user_id, a.graduation_year, a.graduation_class, a.verification_status, a.verified_by, a.verified_at,
+		       a.is_mentor_available, a.mentor_specialization, a.current_company, a.current_position, a.linkedin_url, a.bio,
+		       a.created_at, a.updated_at, a.location, a.portfolio_url, a.privacy_level, a.mentorship_topics, a.skills,
+		       a.willing_to_speak, a.industry, COALESCE(u.full_name, ''), COALESCE(u.email, ''), u.avatar_url
+		FROM alumni_status a JOIN users u ON u.id = a.user_id
+		WHERE a.user_id = $1
+	`, userID).Scan(
+		&s.ID, &s.UserID, &s.GraduationYear, &s.GraduationClass,
+		&s.VerificationStatus, &s.VerifiedBy, &s.VerifiedAt,
+		&s.IsMentorAvailable, &s.MentorSpecialization, &s.CurrentCompany,
+		&s.CurrentPosition, &s.LinkedInURL, &s.Bio,
+		&s.CreatedAt, &s.UpdatedAt, &s.Location, &s.PortfolioURL,
+		&s.PrivacyLevel, &s.MentorshipTopics, &s.Skills,
+		&s.WillingToSpeak, &s.Industry, &s.FullName, &s.Email, &s.AvatarURL,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+type MentorItem struct {
+	ID                   uuid.UUID `json:"id"`
+	UserID               uuid.UUID `json:"user_id"`
+	GraduationYear       int32     `json:"graduation_year"`
+	GraduationClass      *string   `json:"graduation_class"`
+	IsMentorAvailable    bool      `json:"is_mentor_available"`
+	MentorSpecialization *string   `json:"mentor_specialization"`
+	CurrentCompany       *string   `json:"current_company"`
+	CurrentPosition      *string   `json:"current_position"`
+	Bio                  *string   `json:"bio"`
+	FullName             string    `json:"full_name"`
+	Email                string    `json:"email"`
+	Industry             *string   `json:"industry"`
+	Location             *string   `json:"location"`
+}
+
+func (q *Queries) ListAvailableMentors(ctx context.Context) ([]MentorItem, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT a.id, a.user_id, a.graduation_year, a.graduation_class,
+		       a.is_mentor_available, a.mentor_specialization, a.current_company, a.current_position, a.bio,
+		       COALESCE(u.full_name, ''), COALESCE(u.email, ''), a.industry, a.location
+		FROM alumni_status a
+		JOIN users u ON u.id = a.user_id
+		WHERE a.is_mentor_available = true AND a.verification_status = 'verified'
+		ORDER BY a.current_company, u.full_name
+		LIMIT 50
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var mentors []MentorItem
+	for rows.Next() {
+		var m MentorItem
+		if err := rows.Scan(&m.ID, &m.UserID, &m.GraduationYear, &m.GraduationClass,
+			&m.IsMentorAvailable, &m.MentorSpecialization, &m.CurrentCompany, &m.CurrentPosition, &m.Bio,
+			&m.FullName, &m.Email, &m.Industry, &m.Location); err != nil {
+			return nil, err
+		}
+		mentors = append(mentors, m)
+	}
+	return mentors, nil
+}
+
+type MentorshipRequestItem struct {
+	ID          uuid.UUID `json:"id"`
+	StudentID   uuid.UUID `json:"student_id"`
+	MentorID    uuid.UUID `json:"mentor_id"`
+	Topic       string    `json:"topic"`
+	Status      string    `json:"status"`
+	Message     *string   `json:"message"`
+	StudentName string    `json:"student_name"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+func (q *Queries) ListMyMentorshipRequests(ctx context.Context, mentorID uuid.UUID) ([]MentorshipRequestItem, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT mr.id, mr.student_id, mr.mentor_id, mr.topic, mr.status, mr.message, mr.created_at,
+		       COALESCE(u.full_name, '')
+		FROM mentorship_requests mr
+		JOIN users u ON u.id = mr.student_id
+		WHERE mr.mentor_id = $1
+		ORDER BY mr.created_at DESC
+	`, mentorID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []MentorshipRequestItem
+	for rows.Next() {
+		var i MentorshipRequestItem
+		if err := rows.Scan(&i.ID, &i.StudentID, &i.MentorID, &i.Topic, &i.Status, &i.Message, &i.CreatedAt, &i.StudentName); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	return items, nil
+}
+
+func (q *Queries) UpdateAlumniProfile(ctx context.Context, userID uuid.UUID, isMentor *bool, specialization *string, company *string, position *string, linkedinURL *string, bio *string) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE alumni_status SET
+			is_mentor_available = COALESCE($2, is_mentor_available),
+			mentor_specialization = COALESCE($3, mentor_specialization),
+			current_company = COALESCE($4, current_company),
+			current_position = COALESCE($5, current_position),
+			linkedin_url = COALESCE($6, linkedin_url),
+			bio = COALESCE($7, bio),
+			updated_at = NOW()
+		WHERE user_id = $1
+	`, userID, isMentor, specialization, company, position, linkedinURL, bio)
+	return err
+}
+
+// ─── Alumni Enhanced Queries ─────────────────────────────────────────
+
+func (q *Queries) UpdateAlumniProfileFull(ctx context.Context, userID uuid.UUID,
+	location *string, portfolioURL *string, bio *string, linkedinURL *string,
+	isMentor *bool, mentorTopics []byte, skills []byte,
+	willingToSpeak *bool, eventInterests []byte, privacyLevel *string,
+	industry *string, jobTitle *string, currentCompany *string) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE alumni_status SET
+			location = COALESCE($2, location),
+			portfolio_url = COALESCE($3, portfolio_url),
+			bio = COALESCE($4, bio),
+			linkedin_url = COALESCE($5, linkedin_url),
+			is_mentor_available = COALESCE($6, is_mentor_available),
+			mentorship_topics = COALESCE($7, mentorship_topics),
+			skills = COALESCE($8, skills),
+			willing_to_speak = COALESCE($9, willing_to_speak),
+			event_interests = COALESCE($10, event_interests),
+			privacy_level = COALESCE($11, privacy_level),
+			industry = COALESCE($12, industry),
+			job_title = COALESCE($13, job_title),
+			current_company = COALESCE($14, current_company),
+			updated_at = NOW()
+		WHERE user_id = $1
+	`, userID, location, portfolioURL, bio, linkedinURL, isMentor,
+		mentorTopics, skills, willingToSpeak, eventInterests, privacyLevel,
+		industry, jobTitle, currentCompany)
+	return err
+}
+
+// DeleteCourseRegistration deletes a registration header and its registered courses.
+func (q *Queries) DeleteCourseRegistration(ctx context.Context, id uuid.UUID) error {
+	_, _ = q.db.Exec(ctx, `DELETE FROM registered_courses WHERE registration_id = $1`, id)
+	_, err := q.db.Exec(ctx, `DELETE FROM course_registrations WHERE id = $1`, id)
+	return err
+}
+
+type RegisteredStudentForAttendanceRow struct {
+	StudentID          uuid.UUID `json:"student_id"`
+	UserID             uuid.UUID `json:"user_id"`
+	MatricNumber       string    `json:"matric_number"`
+	FullName           string    `json:"full_name"`
+	Level              int32     `json:"level"`
+	ProfilePictureUrl  *string   `json:"profile_picture_url"`
+	RegistrationStatus string    `json:"registration_status"`
+	RegisteredAt       time.Time `json:"registered_at"`
+}
+
+// GetRegisteredStudentsForAttendance returns students who have registered for a specific course (verified registration status).
+func (q *Queries) GetRegisteredStudentsForAttendance(ctx context.Context, courseID uuid.UUID, semesterID uuid.UUID) ([]RegisteredStudentForAttendanceRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT 
+			s.id AS student_id,
+			s.user_id,
+			s.matric_number,
+			u.full_name,
+			s.level,
+			u.avatar_url,
+			cr.status AS registration_status,
+			cr.created_at AS registered_at
+		FROM registered_courses rc
+		JOIN course_registrations cr ON cr.id = rc.registration_id
+		JOIN students s ON s.id = cr.student_id
+		JOIN users u ON u.id = s.user_id
+		WHERE rc.course_id = $1 
+		  AND cr.semester_id = $2
+		ORDER BY s.matric_number ASC
+	`, courseID, semesterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []RegisteredStudentForAttendanceRow
+	for rows.Next() {
+		var r RegisteredStudentForAttendanceRow
+		if err := rows.Scan(
+			&r.StudentID,
+			&r.UserID,
+			&r.MatricNumber,
+			&r.FullName,
+			&r.Level,
+			&r.ProfilePictureUrl,
+			&r.RegistrationStatus,
+			&r.RegisteredAt,
+		); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+type PendingAttendanceReviewRow struct {
+	SessionID      uuid.UUID `json:"session_id"`
+	CourseID       uuid.UUID `json:"course_id"`
+	CourseCode     string    `json:"course_code"`
+	CourseTitle    string    `json:"course_title"`
+	ScheduledDate  string    `json:"scheduled_date"`
+	ClassRepName   string    `json:"class_rep_name"`
+	ClassRepMatric string    `json:"class_rep_matric"`
+	TotalPresent   int32     `json:"total_present"`
+	TotalAbsent    int32     `json:"total_absent"`
+	TotalLate      int32     `json:"total_late"`
+	TotalExcused   int32     `json:"total_excused"`
+	Status         string    `json:"status"`
+	SubmittedAt    time.Time `json:"submitted_at"`
+}
+
+func (q *Queries) GetPendingAttendanceReviews(ctx context.Context, lecturerUserID uuid.UUID) ([]PendingAttendanceReviewRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT
+			asess.id AS session_id,
+			asess.course_id,
+			c.code AS course_code,
+			c.title AS course_title,
+			COALESCE(asess.date::text, asess.created_at::date::text) AS scheduled_date,
+			COALESCE(u.full_name, 'Class Rep') AS class_rep_name,
+			COALESCE(st.matric_number, '') AS class_rep_matric,
+			COALESCE(asess.total_present, 0) AS total_present,
+			COALESCE(asess.total_absent, 0) AS total_absent,
+			0 AS total_late,
+			0 AS total_excused,
+			asess.status,
+			asess.created_at AS submitted_at
+		FROM attendance_sessions asess
+		JOIN courses c ON c.id = asess.course_id
+		LEFT JOIN users u ON u.id = asess.class_rep_id
+		LEFT JOIN students st ON st.user_id = u.id
+		WHERE asess.status IN ('pending_lecturer_review', 'pending', 'submitted')
+		  AND (
+			c.lecturer_id = $1
+			OR EXISTS (
+				SELECT 1 FROM lecturer_course_assignments lca
+				WHERE lca.course_id = c.id AND lca.lecturer_id = $1
+			)
+		  )
+		ORDER BY asess.created_at DESC
+	`, lecturerUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []PendingAttendanceReviewRow
+	for rows.Next() {
+		var r PendingAttendanceReviewRow
+		if err := rows.Scan(
+			&r.SessionID,
+			&r.CourseID,
+			&r.CourseCode,
+			&r.CourseTitle,
+			&r.ScheduledDate,
+			&r.ClassRepName,
+			&r.ClassRepMatric,
+			&r.TotalPresent,
+			&r.TotalAbsent,
+			&r.TotalLate,
+			&r.TotalExcused,
+			&r.Status,
+			&r.SubmittedAt,
+		); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+func (q *Queries) GetLecturerAttendanceHistory(ctx context.Context, lecturerUserID uuid.UUID) ([]PendingAttendanceReviewRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT
+			asess.id AS session_id,
+			asess.course_id,
+			c.code AS course_code,
+			c.title AS course_title,
+			COALESCE(asess.date::text, asess.created_at::date::text) AS scheduled_date,
+			COALESCE(u.full_name, 'Class Rep') AS class_rep_name,
+			COALESCE(st.matric_number, '') AS class_rep_matric,
+			COALESCE(asess.total_present, 0) AS total_present,
+			COALESCE(asess.total_absent, 0) AS total_absent,
+			0 AS total_late,
+			0 AS total_excused,
+			asess.status,
+			asess.created_at AS submitted_at
+		FROM attendance_sessions asess
+		JOIN courses c ON c.id = asess.course_id
+		LEFT JOIN users u ON u.id = asess.class_rep_id
+		LEFT JOIN students st ON st.user_id = u.id
+		WHERE (
+			c.lecturer_id = $1
+			OR EXISTS (
+				SELECT 1 FROM lecturer_course_assignments lca
+				WHERE lca.course_id = c.id AND lca.lecturer_id = $1
+			)
+		  )
+		ORDER BY asess.created_at DESC
+	`, lecturerUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []PendingAttendanceReviewRow
+	for rows.Next() {
+		var r PendingAttendanceReviewRow
+		if err := rows.Scan(
+			&r.SessionID,
+			&r.CourseID,
+			&r.CourseCode,
+			&r.CourseTitle,
+			&r.ScheduledDate,
+			&r.ClassRepName,
+			&r.ClassRepMatric,
+			&r.TotalPresent,
+			&r.TotalAbsent,
+			&r.TotalLate,
+			&r.TotalExcused,
+			&r.Status,
+			&r.SubmittedAt,
+		); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+type AttendanceSessionDetails struct {
+	ID             uuid.UUID
+	CourseID       uuid.UUID
+	ClassRepID     uuid.UUID
+	LecturerID     *uuid.UUID
+	DepartmentName string
+	CourseCode     string
+	CourseTitle    string
+	Level          int32
+	Date           time.Time
+	StartTime      string
+	EndTime        string
+	Venue          string
+	LecturerName   string
+	ClassRepName   string
+}
+
+// GetAttendanceSessionDetails returns full session metadata for PDF generation.
+func (q *Queries) GetAttendanceSessionDetails(ctx context.Context, sessionID uuid.UUID) (*AttendanceSessionDetails, error) {
+	row := q.db.QueryRow(ctx, `
+		SELECT 
+			asess.id,
+			asess.course_id,
+			asess.class_rep_id,
+			c.lecturer_id,
+			COALESCE(c.code, '') AS course_code,
+			COALESCE(c.title, '') AS course_title,
+			COALESCE(c.level, 400) AS level,
+			COALESCE(asess.date, asess.created_at) AS date,
+			COALESCE(TO_CHAR(asess.started_at, 'HH24:MI'), '08:00') AS start_time,
+			COALESCE(TO_CHAR(asess.closed_at, 'HH24:MI'), '10:00') AS end_time,
+			COALESCE(asess.venue, 'LT 1') AS venue,
+			COALESCE(lec.full_name, 'N/A') AS lecturer_name,
+			COALESCE(rep.full_name, 'Class Representative') AS class_rep_name
+		FROM attendance_sessions asess
+		JOIN courses c ON c.id = asess.course_id
+		LEFT JOIN users rep ON rep.id = asess.class_rep_id
+		LEFT JOIN users lec ON lec.id = c.lecturer_id
+		WHERE asess.id = $1
+	`, sessionID)
+
+	var d AttendanceSessionDetails
+	var lecID pgtype.UUID
+
+	err := row.Scan(
+		&d.ID,
+		&d.CourseID,
+		&d.ClassRepID,
+		&lecID,
+		&d.CourseCode,
+		&d.CourseTitle,
+		&d.Level,
+		&d.Date,
+		&d.StartTime,
+		&d.EndTime,
+		&d.Venue,
+		&d.LecturerName,
+		&d.ClassRepName,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if lecID.Valid {
+		var uid [16]byte = lecID.Bytes
+		u := uuid.UUID(uid)
+		d.LecturerID = &u
+	}
+	d.DepartmentName = "COMPUTER ENGINEERING"
+	return &d, nil
+}
+
+func (q *Queries) GetAIInteraction(ctx context.Context, id uuid.UUID) (AiInteraction, error) {
+	row := q.db.QueryRow(ctx, `SELECT id, user_id, feature, session_id, input_text, output_text, confidence_score, context, model_used, response_time_ms, user_feedback, was_accurate, created_at FROM ai_interactions WHERE id = $1`, id)
+	var i AiInteraction
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Feature,
+		&i.SessionID,
+		&i.InputText,
+		&i.OutputText,
+		&i.ConfidenceScore,
+		&i.Context,
+		&i.ModelUsed,
+		&i.ResponseTimeMs,
+		&i.UserFeedback,
+		&i.WasAccurate,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const attendanceSessionCountedStatusesSQL = `asess.status NOT IN ('draft', 'open', 'rejected')`
+
+type StudentCourseAttendanceOverviewRow struct {
+	CourseID      uuid.UUID `json:"course_id"`
+	CourseCode    string    `json:"course_code"`
+	CourseTitle   string    `json:"course_title"`
+	TotalSessions int32     `json:"total_sessions"`
+	PresentCount  int32     `json:"present_count"`
+}
+
+func (q *Queries) GetStudentCourseAttendanceOverview(ctx context.Context, studentID uuid.UUID, semesterID uuid.UUID, semStart time.Time, semEnd time.Time) ([]StudentCourseAttendanceOverviewRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT
+			c.id AS course_id,
+			c.code AS course_code,
+			c.title AS course_title,
+			COUNT(DISTINCT asess.id) AS total_sessions,
+			COUNT(DISTINCT asess.id) FILTER (WHERE ac.present = true) AS present_count
+		FROM registered_courses rc
+		JOIN course_registrations cr ON cr.id = rc.registration_id
+		JOIN students s ON s.id = cr.student_id
+		JOIN courses c ON c.id = rc.course_id
+		LEFT JOIN attendance_sessions asess
+			ON asess.course_id = c.id
+			AND `+attendanceSessionCountedStatusesSQL+`
+			AND asess.created_at BETWEEN $3 AND $4
+		LEFT JOIN attendance_checkins ac
+			ON ac.session_id = asess.id AND ac.student_id = s.user_id
+		WHERE cr.student_id = $1 AND cr.semester_id = $2
+		GROUP BY c.id, c.code, c.title
+		ORDER BY c.code
+	`, studentID, semesterID, semStart, semEnd)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []StudentCourseAttendanceOverviewRow
+	for rows.Next() {
+		var r StudentCourseAttendanceOverviewRow
+		if err := rows.Scan(&r.CourseID, &r.CourseCode, &r.CourseTitle, &r.TotalSessions, &r.PresentCount); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+type StudentCourseAttendanceSessionRow struct {
+	SessionID uuid.UUID `json:"session_id"`
+	Date      time.Time `json:"date"`
+	Venue     string    `json:"venue"`
+	Status    string    `json:"status"`
+	Present   bool      `json:"present"`
+	Remark    *string   `json:"remark"`
+}
+
+func (q *Queries) GetStudentCourseAttendanceSessions(ctx context.Context, courseID uuid.UUID, studentUserID uuid.UUID, semStart time.Time, semEnd time.Time) ([]StudentCourseAttendanceSessionRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT
+			asess.id AS session_id,
+			COALESCE(asess.date, asess.created_at) AS date,
+			COALESCE(asess.venue, '') AS venue,
+			asess.status,
+			COALESCE(ac.present, false) AS present,
+			ac.remark
+		FROM attendance_sessions asess
+		LEFT JOIN attendance_checkins ac
+			ON ac.session_id = asess.id AND ac.student_id = $2
+		WHERE asess.course_id = $1
+			AND `+attendanceSessionCountedStatusesSQL+`
+			AND asess.created_at BETWEEN $3 AND $4
+		ORDER BY asess.created_at DESC
+	`, courseID, studentUserID, semStart, semEnd)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []StudentCourseAttendanceSessionRow
+	for rows.Next() {
+		var r StudentCourseAttendanceSessionRow
+		if err := rows.Scan(&r.SessionID, &r.Date, &r.Venue, &r.Status, &r.Present, &r.Remark); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+type LecturerCourseAttendanceOverviewRow struct {
+	CourseID          uuid.UUID `json:"course_id"`
+	CourseCode        string    `json:"course_code"`
+	CourseTitle       string    `json:"course_title"`
+	ClassSize         int32     `json:"class_size"`
+	TotalSessions     int32     `json:"total_sessions"`
+	AvgAttendanceRate float64   `json:"avg_attendance_rate"`
+}
+
+func (q *Queries) GetLecturerCourseAttendanceOverview(ctx context.Context, lecturerUserID uuid.UUID, semesterID uuid.UUID, semStart time.Time, semEnd time.Time) ([]LecturerCourseAttendanceOverviewRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT
+			c.id AS course_id,
+			c.code AS course_code,
+			c.title AS course_title,
+			COALESCE(roster.class_size, 0) AS class_size,
+			COALESCE(sess.total_sessions, 0) AS total_sessions,
+			COALESCE(sess.avg_rate, 0) AS avg_attendance_rate
+		FROM courses c
+		LEFT JOIN LATERAL (
+			SELECT COUNT(DISTINCT rc.id) AS class_size
+			FROM registered_courses rc
+			JOIN course_registrations cr ON cr.id = rc.registration_id
+			WHERE rc.course_id = c.id AND cr.semester_id = $2
+		) roster ON true
+		LEFT JOIN LATERAL (
+			SELECT
+				COUNT(*) AS total_sessions,
+				AVG(
+					CASE WHEN asess.total_students > 0
+						THEN asess.total_present::float / asess.total_students * 100
+					END
+				) AS avg_rate
+			FROM attendance_sessions asess
+			WHERE asess.course_id = c.id
+				AND `+attendanceSessionCountedStatusesSQL+`
+				AND asess.created_at BETWEEN $3 AND $4
+		) sess ON true
+		WHERE c.lecturer_id = $1
+			OR EXISTS (
+				SELECT 1 FROM lecturer_course_assignments lca
+				WHERE lca.course_id = c.id AND lca.lecturer_id = $1
+			)
+		ORDER BY c.code
+	`, lecturerUserID, semesterID, semStart, semEnd)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []LecturerCourseAttendanceOverviewRow
+	for rows.Next() {
+		var r LecturerCourseAttendanceOverviewRow
+		if err := rows.Scan(&r.CourseID, &r.CourseCode, &r.CourseTitle, &r.ClassSize, &r.TotalSessions, &r.AvgAttendanceRate); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+type CalendarFeedUserRow struct {
+	ID       uuid.UUID `json:"id"`
+	Role     string    `json:"role"`
+	FullName string    `json:"full_name"`
+}
+
+func (q *Queries) GetUserByCalendarFeedToken(ctx context.Context, token string) (CalendarFeedUserRow, error) {
+	row := q.db.QueryRow(ctx, `SELECT id, role::text, full_name FROM users WHERE calendar_feed_token = $1`, token)
+	var r CalendarFeedUserRow
+	err := row.Scan(&r.ID, &r.Role, &r.FullName)
+	return r, err
+}
+
+func (q *Queries) SetUserCalendarFeedToken(ctx context.Context, userID uuid.UUID, token string) error {
+	_, err := q.db.Exec(ctx, `UPDATE users SET calendar_feed_token = $2 WHERE id = $1`, userID, token)
+	return err
+}
+
+
+func (q *Queries) GetUserCalendarFeedToken(ctx context.Context, userID uuid.UUID) (*string, error) {
+	var token *string
+	err := q.db.QueryRow(ctx, `SELECT calendar_feed_token FROM users WHERE id = $1`, userID).Scan(&token)
+	return token, err
+}
+
+func (q *Queries) GetUserIDByUnsubscribeToken(ctx context.Context, token string) (uuid.UUID, error) {
+	var userID uuid.UUID
+	err := q.db.QueryRow(ctx, `SELECT user_id FROM notification_preferences WHERE unsubscribe_token = $1`, token).Scan(&userID)
+	return userID, err
+}
+
+func (q *Queries) GetOrCreateNotificationUnsubscribeToken(ctx context.Context, userID uuid.UUID) (string, error) {
+	var token *string
+	err := q.db.QueryRow(ctx, `SELECT unsubscribe_token FROM notification_preferences WHERE user_id = $1`, userID).Scan(&token)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return "", err
+	}
+	if token != nil && *token != "" {
+		return *token, nil
+	}
+
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	newToken := hex.EncodeToString(b)
+
+	if _, err := q.db.Exec(ctx, `
+		INSERT INTO notification_preferences (user_id, unsubscribe_token)
+		VALUES ($1, $2)
+		ON CONFLICT (tenant_id, user_id) DO UPDATE SET unsubscribe_token = $2
+	`, userID, newToken); err != nil {
+		return "", err
+	}
+	return newToken, nil
+}
+
+type BirthdayGreetingRow struct {
+	ID        uuid.UUID `json:"id"`
+	Email     string    `json:"email"`
+	FirstName string    `json:"first_name"`
+}
+
+func (q *Queries) ListTodaysBirthdays(ctx context.Context) ([]BirthdayGreetingRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT id, email, first_name
+		FROM users
+		WHERE role = 'student'
+			AND is_active = true
+			AND date_of_birth IS NOT NULL
+			AND EXTRACT(MONTH FROM date_of_birth) = EXTRACT(MONTH FROM CURRENT_DATE)
+			AND EXTRACT(DAY FROM date_of_birth) = EXTRACT(DAY FROM CURRENT_DATE)
+			AND (last_birthday_greeted_year IS NULL OR last_birthday_greeted_year <> EXTRACT(YEAR FROM CURRENT_DATE)::int)
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []BirthdayGreetingRow
+	for rows.Next() {
+		var r BirthdayGreetingRow
+		if err := rows.Scan(&r.ID, &r.Email, &r.FirstName); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+func (q *Queries) MarkBirthdayGreeted(ctx context.Context, userID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, `UPDATE users SET last_birthday_greeted_year = EXTRACT(YEAR FROM CURRENT_DATE)::int WHERE id = $1`, userID)
+	return err
+}
+
+type DueStudyTaskReminderRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+	Title  string    `json:"title"`
+}
+
+// ListDueStudyTaskReminders finds tasks whose reminder_at has arrived and
+// hasn't been sent yet — reminder_at is cleared (one-shot) by
+// ClearStudyTaskReminder right after a successful send, which is also what
+// keeps a task off this list on the next poll rather than a separate
+// "already reminded" flag.
+func (q *Queries) ListDueStudyTaskReminders(ctx context.Context) ([]DueStudyTaskReminderRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT id, user_id, title
+		FROM study_tasks
+		WHERE reminder_at IS NOT NULL
+			AND reminder_at <= NOW()
+			AND status NOT IN ('completed', 'cancelled')
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []DueStudyTaskReminderRow
+	for rows.Next() {
+		var r DueStudyTaskReminderRow
+		if err := rows.Scan(&r.ID, &r.UserID, &r.Title); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+func (q *Queries) ClearStudyTaskReminder(ctx context.Context, taskID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, `UPDATE study_tasks SET reminder_at = NULL WHERE id = $1`, taskID)
+	return err
+}
+
+
+
+func (q *Queries) CreateReport(ctx context.Context, title, reportType, format string, generatedBy uuid.UUID) (Report, error) {
+	var r Report
+	err := q.db.QueryRow(ctx, `
+		INSERT INTO reports (title, report_type, format, status, generated_by)
+		VALUES ($1, $2, $3, 'generating', $4)
+		RETURNING id, title, report_type, format, file_url, status, generated_by, parameters, row_count, created_at, completed_at
+	`, title, reportType, format, generatedBy).Scan(
+		&r.ID, &r.Title, &r.ReportType, &r.Format, &r.FileUrl, &r.Status, &r.GeneratedBy, &r.Parameters, &r.RowCount, &r.CreatedAt, &r.CompletedAt,
+	)
+	return r, err
+}
+
+func (q *Queries) CompleteReport(ctx context.Context, id uuid.UUID, fileURL string, rowCount int32) error {
+	_, err := q.db.Exec(ctx, `
+		UPDATE reports SET status = 'completed', file_url = $2, row_count = $3, completed_at = NOW()
+		WHERE id = $1
+	`, id, fileURL, rowCount)
+	return err
+}
+
+func (q *Queries) FailReport(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, `UPDATE reports SET status = 'failed', completed_at = NOW() WHERE id = $1`, id)
+	return err
+}
+
+func (q *Queries) ListReports(ctx context.Context, limit int32) ([]Report, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT id, title, report_type, format, file_url, status, generated_by, parameters, row_count, created_at, completed_at
+		FROM reports
+		ORDER BY created_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []Report
+	for rows.Next() {
+		var r Report
+		if err := rows.Scan(&r.ID, &r.Title, &r.ReportType, &r.Format, &r.FileUrl, &r.Status, &r.GeneratedBy, &r.Parameters, &r.RowCount, &r.CreatedAt, &r.CompletedAt); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+type RegisteredCourseDetailRow struct {
+	CourseCode string `json:"course_code"`
+	CourseName string `json:"course_name"`
+	Unit       int32  `json:"unit"`
+}
+
+
+func (q *Queries) GetStudentRegisteredCourseDetails(ctx context.Context, studentID uuid.UUID, semesterID uuid.UUID) ([]RegisteredCourseDetailRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT c.code, c.title, c.unit
+		FROM registered_courses rc
+		JOIN course_registrations cr ON cr.id = rc.registration_id
+		JOIN courses c ON c.id = rc.course_id
+		WHERE cr.student_id = $1 AND cr.semester_id = $2
+		ORDER BY c.code
+	`, studentID, semesterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []RegisteredCourseDetailRow
+	for rows.Next() {
+		var r RegisteredCourseDetailRow
+		if err := rows.Scan(&r.CourseCode, &r.CourseName, &r.Unit); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// ─── CRF signing 
+
+
+type CRFSignatureAsset struct {
+	ID         uuid.UUID `json:"id"`
+	Kind       string    `json:"kind"`
+	FilePath   string    `json:"file_path"`
+	UploadedBy uuid.UUID `json:"uploaded_by"`
+	UploadedAt time.Time `json:"uploaded_at"`
+}
+
+// UpsertCRFSignatureAssetParams carries just the signer's signature image —
+// where it lands on a student's form is decided by that student at signing
+// time, not configured here.
+type UpsertCRFSignatureAssetParams struct {
+	Kind       string
+	FilePath   string
+	UploadedBy uuid.UUID
+}
+
+var crfSignatureAssetColumns = `id, kind, file_path, uploaded_by, uploaded_at`
+
+func scanCRFSignatureAsset(row pgx.Row) (CRFSignatureAsset, error) {
+	var a CRFSignatureAsset
+	err := row.Scan(
+		&a.ID, &a.Kind, &a.FilePath, &a.UploadedBy, &a.UploadedAt,
+	)
+	return a, err
+}
+
+func (q *Queries) UpsertCRFSignatureAsset(ctx context.Context, arg UpsertCRFSignatureAssetParams) (CRFSignatureAsset, error) {
+	row := q.db.QueryRow(ctx, `
+		INSERT INTO crf_signature_assets (kind, file_path, uploaded_by)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (tenant_id, kind) DO UPDATE SET
+			file_path = EXCLUDED.file_path,
+			uploaded_by = EXCLUDED.uploaded_by,
+			uploaded_at = NOW()
+		RETURNING `+crfSignatureAssetColumns,
+		arg.Kind, arg.FilePath, arg.UploadedBy,
+	)
+	return scanCRFSignatureAsset(row)
+}
+
+// GetCRFSignatureAsset returns pgx.ErrNoRows if this kind hasn't been
+// configured yet.
+func (q *Queries) GetCRFSignatureAsset(ctx context.Context, kind string) (CRFSignatureAsset, error) {
+	row := q.db.QueryRow(ctx, `SELECT `+crfSignatureAssetColumns+` FROM crf_signature_assets WHERE kind = $1`, kind)
+	return scanCRFSignatureAsset(row)
+}
+
+func (q *Queries) ListCRFSignatureAssets(ctx context.Context) ([]CRFSignatureAsset, error) {
+	rows, err := q.db.Query(ctx, `SELECT `+crfSignatureAssetColumns+` FROM crf_signature_assets ORDER BY kind`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []CRFSignatureAsset
+	for rows.Next() {
+		a, err := scanCRFSignatureAsset(rows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, a)
+	}
+	return results, rows.Err()
+}
+
+// DeleteCRFSignatureAsset removes a kind's configured signature entirely —
+// students uploading a CRF afterward get it back with only whichever
+// signature(s) are still configured.
+func (q *Queries) DeleteCRFSignatureAsset(ctx context.Context, kind string) error {
+	_, err := q.db.Exec(ctx, `DELETE FROM crf_signature_assets WHERE kind = $1`, kind)
+	return err
+}
+
+type CRFSigningSubmission struct {
+	ID               uuid.UUID      `json:"id"`
+	UserID           uuid.UUID      `json:"user_id"`
+	SemesterID       uuid.UUID      `json:"semester_id"`
+	OriginalFilePath string         `json:"original_file_path"`
+	SignedFilePath   string         `json:"signed_file_path"`
+	Placements       CRFPlacements  `json:"placements"`
+	Status           string         `json:"status"`
+	CreatedAt        time.Time      `json:"created_at"`
+}
+
+// CRFPlacements maps each signer kind to where the student placed that
+// signature on their own form. Persisted with the submission at approve time
+// so the stamping is auditable and reproducible.
+type CRFPlacement struct {
+	Page         int32    `json:"page"`
+	X            float64  `json:"x"`
+	Y            float64  `json:"y"`
+	Width        float64  `json:"width"`
+	MaxHeight    float64  `json:"max_height,omitempty"`
+	ShowDate     bool     `json:"show_date,omitempty"`
+	DateX        *float64 `json:"date_x,omitempty"`
+	DateY        *float64 `json:"date_y,omitempty"`
+	DateFontSize float64  `json:"date_font_size,omitempty"`
+}
+
+type CRFPlacements map[string]CRFPlacement
+
+func (p CRFPlacements) Value() (driver.Value, error) {
+	if p == nil {
+		return []byte(`{}`), nil
+	}
+	return json.Marshal(p)
+}
+
+func (p *CRFPlacements) Scan(src any) error {
+	if src == nil {
+		*p = CRFPlacements{}
+		return nil
+	}
+	var b []byte
+	switch v := src.(type) {
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	default:
+		return fmt.Errorf("unsupported placements type %T", src)
+	}
+	return json.Unmarshal(b, p)
+}
+
+var crfSubmissionColumns = `id, user_id, semester_id, original_file_path, signed_file_path, placements, status, created_at`
+
+func scanCRFSigningSubmission(row pgx.Row) (CRFSigningSubmission, error) {
+	var s CRFSigningSubmission
+	err := row.Scan(
+		&s.ID, &s.UserID, &s.SemesterID, &s.OriginalFilePath, &s.SignedFilePath,
+		&s.Placements, &s.Status, &s.CreatedAt,
+	)
+	return s, err
+}
+
+// GetCRFSubmissionForUserSemester returns pgx.ErrNoRows when the student
+// hasn't uploaded a CRF yet this semester — the caller uses that to decide
+// whether to show the upload form or the existing signed copy.
+func (q *Queries) GetCRFSubmissionForUserSemester(ctx context.Context, userID, semesterID uuid.UUID) (CRFSigningSubmission, error) {
+	row := q.db.QueryRow(ctx, `
+		SELECT `+crfSubmissionColumns+`
+		FROM crf_signing_submissions
+		WHERE user_id = $1 AND semester_id = $2
+	`, userID, semesterID)
+	return scanCRFSigningSubmission(row)
+}
+
+func (q *Queries) CreateCRFSigningSubmission(ctx context.Context, userID, semesterID uuid.UUID, originalFilePath string) (CRFSigningSubmission, error) {
+	row := q.db.QueryRow(ctx, `
+		INSERT INTO crf_signing_submissions (user_id, semester_id, original_file_path, signed_file_path, placements, status)
+		VALUES ($1, $2, $3, '', '{}'::jsonb, 'draft')
+		RETURNING `+crfSubmissionColumns,
+		userID, semesterID, originalFilePath)
+	return scanCRFSigningSubmission(row)
+}
+
+// SaveCRFPlacements records the student's per-signer alignment on their own
+// form while the submission is still a draft, returning the updated row.
+func (q *Queries) SaveCRFPlacements(ctx context.Context, id uuid.UUID, placements CRFPlacements) (CRFSigningSubmission, error) {
+	row := q.db.QueryRow(ctx, `
+		UPDATE crf_signing_submissions
+		SET placements = $2
+		WHERE id = $1 AND status = 'draft'
+		RETURNING `+crfSubmissionColumns,
+		id, placements)
+	return scanCRFSigningSubmission(row)
+}
+
+// ApproveCRFSigningSubmission stamps the server-rendered PDF path and flips
+// the submission to 'completed'. Only a draft can be approved — a completed
+// submission is final (the one-upload-per-semester rule).
+func (q *Queries) ApproveCRFSigningSubmission(ctx context.Context, id uuid.UUID, signedFilePath string) (CRFSigningSubmission, error) {
+	row := q.db.QueryRow(ctx, `
+		UPDATE crf_signing_submissions
+		SET signed_file_path = $2, status = 'completed'
+		WHERE id = $1 AND status = 'draft'
+		RETURNING `+crfSubmissionColumns,
+		id, signedFilePath)
+	return scanCRFSigningSubmission(row)
+}
+
+// GetCRFDraftSubmission returns the student's draft (placement-in-progress)
+// submission for the active semester, pgx.ErrNoRows if none.
+func (q *Queries) GetCRFDraftSubmission(ctx context.Context, userID, semesterID uuid.UUID) (CRFSigningSubmission, error) {
+	row := q.db.QueryRow(ctx, `
+		SELECT `+crfSubmissionColumns+`
+		FROM crf_signing_submissions
+		WHERE user_id = $1 AND semester_id = $2 AND status = 'draft'
+	`, userID, semesterID)
+	return scanCRFSigningSubmission(row)
+}
+
+// ListCRFDraftsForUser lists the student's unfinished submissions (current
+// semester + backlog drafts) so a saved alignment can be resumed.
+func (q *Queries) ListCRFDraftsForUser(ctx context.Context, userID uuid.UUID) ([]CRFSigningSubmission, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT `+crfSubmissionColumns+`
+		FROM crf_signing_submissions
+		WHERE user_id = $1 AND status = 'draft'
+		ORDER BY created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := []CRFSigningSubmission{}
+	for rows.Next() {
+		s, err := scanCRFSigningSubmission(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, s)
+	}
+	return items, rows.Err()
+}
+
+func (q *Queries) GetCRFSigningSubmission(ctx context.Context, id uuid.UUID) (CRFSigningSubmission, error) {
+	row := q.db.QueryRow(ctx, `
+		SELECT `+crfSubmissionColumns+`
+		FROM crf_signing_submissions
+		WHERE id = $1
+	`, id)
+	return scanCRFSigningSubmission(row)
+}
+
+// ─── CRF backlog (old/unsigned course forms from past semesters) ───
+
+type CRFBacklogPrice struct {
+	AmountPerBacklog decimal.Decimal `json:"amount_per_backlog"`
+	UpdatedBy        *uuid.UUID      `json:"updated_by"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+}
+
+func (q *Queries) GetCRFBacklogPrice(ctx context.Context) (CRFBacklogPrice, error) {
+	row := q.db.QueryRow(ctx, `SELECT amount_per_backlog, updated_by, updated_at FROM crf_backlog_price WHERE id = 1`)
+	var p CRFBacklogPrice
+	err := row.Scan(&p.AmountPerBacklog, &p.UpdatedBy, &p.UpdatedAt)
+	return p, err
+}
+
+func (q *Queries) UpdateCRFBacklogPrice(ctx context.Context, amount decimal.Decimal, updatedBy uuid.UUID) (CRFBacklogPrice, error) {
+	row := q.db.QueryRow(ctx, `
+		UPDATE crf_backlog_price
+		SET amount_per_backlog = $1, updated_by = $2, updated_at = NOW()
+		WHERE id = 1
+		RETURNING amount_per_backlog, updated_by, updated_at
+	`, amount, updatedBy)
+	var p CRFBacklogPrice
+	err := row.Scan(&p.AmountPerBacklog, &p.UpdatedBy, &p.UpdatedAt)
+	return p, err
+}
+
+type CRFBacklogRequest struct {
+	ID             uuid.UUID       `json:"id"`
+	UserID         uuid.UUID       `json:"user_id"`
+	RequestedCount int32           `json:"requested_count"`
+	Amount         decimal.Decimal `json:"amount"`
+	PaymentID      *uuid.UUID      `json:"payment_id"`
+	Status         string          `json:"status"`
+	FormsSubmitted int32           `json:"forms_submitted"`
+	CreatedAt      time.Time       `json:"created_at"`
+	PaidAt         *time.Time      `json:"paid_at"`
+}
+
+var crfBacklogRequestColumns = `id, user_id, requested_count, amount, payment_id, status, forms_submitted, created_at, paid_at`
+
+func scanCRFBacklogRequest(row pgx.Row) (CRFBacklogRequest, error) {
+	var r CRFBacklogRequest
+	err := row.Scan(&r.ID, &r.UserID, &r.RequestedCount, &r.Amount, &r.PaymentID, &r.Status, &r.FormsSubmitted, &r.CreatedAt, &r.PaidAt)
+	return r, err
+}
+
+func (q *Queries) CreateCRFBacklogRequest(ctx context.Context, userID uuid.UUID, requestedCount int32, amount decimal.Decimal) (CRFBacklogRequest, error) {
+	row := q.db.QueryRow(ctx, `
+		INSERT INTO crf_backlog_requests (user_id, requested_count, amount)
+		VALUES ($1, $2, $3)
+		RETURNING `+crfBacklogRequestColumns,
+		userID, requestedCount, amount,
+	)
+	return scanCRFBacklogRequest(row)
+}
+
+func (q *Queries) SetCRFBacklogRequestPayment(ctx context.Context, id, paymentID uuid.UUID) (CRFBacklogRequest, error) {
+	row := q.db.QueryRow(ctx, `
+		UPDATE crf_backlog_requests SET payment_id = $2 WHERE id = $1
+		RETURNING `+crfBacklogRequestColumns,
+		id, paymentID,
+	)
+	return scanCRFBacklogRequest(row)
+}
+
+// GetLatestCRFBacklogRequest returns pgx.ErrNoRows when the student has never
+// made a backlog request.
+func (q *Queries) GetLatestCRFBacklogRequest(ctx context.Context, userID uuid.UUID) (CRFBacklogRequest, error) {
+	row := q.db.QueryRow(ctx, `
+		SELECT `+crfBacklogRequestColumns+`
+		FROM crf_backlog_requests
+		WHERE user_id = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, userID)
+	return scanCRFBacklogRequest(row)
+}
+
+func (q *Queries) GetCRFBacklogRequestByPaymentID(ctx context.Context, paymentID uuid.UUID) (CRFBacklogRequest, error) {
+	row := q.db.QueryRow(ctx, `SELECT `+crfBacklogRequestColumns+` FROM crf_backlog_requests WHERE payment_id = $1`, paymentID)
+	return scanCRFBacklogRequest(row)
+}
+
+func (q *Queries) MarkCRFBacklogRequestPaid(ctx context.Context, id uuid.UUID) (CRFBacklogRequest, error) {
+	row := q.db.QueryRow(ctx, `
+		UPDATE crf_backlog_requests SET status = 'paid', paid_at = NOW() WHERE id = $1
+		RETURNING `+crfBacklogRequestColumns,
+		id,
+	)
+	return scanCRFBacklogRequest(row)
+}
+
+func (q *Queries) IncrementCRFBacklogFormsSubmitted(ctx context.Context, id uuid.UUID) (CRFBacklogRequest, error) {
+	row := q.db.QueryRow(ctx, `
+		UPDATE crf_backlog_requests SET forms_submitted = forms_submitted + 1 WHERE id = $1
+		RETURNING `+crfBacklogRequestColumns,
+		id,
+	)
+	return scanCRFBacklogRequest(row)
+}
+
+// EnsureGroupInviteCode returns a group's short invite code, generating and
+// persisting one on first use — the raw group UUID makes for an unwieldy
+// share link, so invite links use this short code instead.
+func (q *Queries) EnsureGroupInviteCode(ctx context.Context, groupID uuid.UUID) (string, error) {
+	var existing *string
+	if err := q.db.QueryRow(ctx, `SELECT invite_code FROM groups WHERE id = $1`, groupID).Scan(&existing); err != nil {
+		return "", err
+	}
+	if existing != nil && *existing != "" {
+		return *existing, nil
+	}
+
+	for attempt := 0; attempt < 5; attempt++ {
+		b := make([]byte, 4)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		code := hex.EncodeToString(b)
+		if _, err := q.db.Exec(ctx, `UPDATE groups SET invite_code = $2 WHERE id = $1`, groupID, code); err != nil {
+			continue // likely a unique constraint collision — try another code
+		}
+		return code, nil
+	}
+	return "", fmt.Errorf("failed to generate a unique invite code")
+}
+
+type GroupByCodeRow struct {
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	Description *string   `json:"description"`
+	AvatarUrl   *string   `json:"avatar_url"`
+	IsPrivate   bool      `json:"is_private"`
+	MemberCount int64     `json:"member_count"`
+}
+
+func (q *Queries) GetGroupByInviteCode(ctx context.Context, code string) (GroupByCodeRow, error) {
+	var r GroupByCodeRow
+	err := q.db.QueryRow(ctx, `
+		SELECT g.id, g.name, g.description, g.avatar_url, g.is_private,
+			(SELECT COUNT(*) FROM group_members WHERE group_id = g.id) AS member_count
+		FROM groups g
+		WHERE g.invite_code = $1
+	`, code).Scan(&r.ID, &r.Name, &r.Description, &r.AvatarUrl, &r.IsPrivate, &r.MemberCount)
+	return r, err
+}
+
+// GetGroupMemberRole returns the caller's role in a group ("admin",
+// "moderator", "member") or sql.ErrNoRows if they aren't a member at all —
+// used to gate admin-only actions like adding other members.
+func (q *Queries) GetGroupMemberRole(ctx context.Context, groupID, userID uuid.UUID) (string, error) {
+	var role string
+	err := q.db.QueryRow(ctx, `
+		SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2
+	`, groupID, userID).Scan(&role)
+	return role, err
+}
+
+// ==================== CONNECT: CONVERSATION PREVIEWS ====================
+// Neither ListUserConnections nor ListUserGroups join in each thread's most
+// recent message, which the redesigned Connect page's list panels need
+// (name + last message snippet + timestamp, like any real chat app). These
+// two queries add that via a LATERAL join instead of touching the sqlc
+// generated files.
+
+type DMConversationRow struct {
+	ConnectionID      uuid.UUID          `json:"connection_id"`
+	OtherUserID       uuid.UUID          `json:"other_user_id"`
+	OtherFullName     string             `json:"other_full_name"`
+	OtherAvatarUrl    *string            `json:"other_avatar_url"`
+	LastMessage       *string            `json:"last_message"`
+	LastMessageAt     pgtype.Timestamptz `json:"last_message_at"`
+	LastMessageMine   bool               `json:"last_message_mine"`
+	UnreadCount       int32              `json:"unread_count"`
+}
+
+func (q *Queries) ListDMConversations(ctx context.Context, userID uuid.UUID) ([]DMConversationRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT
+			c.id AS connection_id,
+			ou.id AS other_user_id,
+			ou.full_name AS other_full_name,
+			ou.avatar_url AS other_avatar_url,
+			lm.content AS last_message,
+			lm.created_at AS last_message_at,
+			COALESCE(lm.sender_id = $1, false) AS last_message_mine,
+			COALESCE((
+				SELECT COUNT(*) FROM messages um
+				WHERE um.sender_id = ou.id AND um.receiver_id = $1 AND um.is_read = false
+			), 0)::int AS unread_count
+		FROM connections c
+		JOIN users ou ON ou.id = (CASE WHEN c.requester_id = $1 THEN c.receiver_id ELSE c.requester_id END)
+		LEFT JOIN LATERAL (
+			SELECT content, created_at, sender_id
+			FROM messages m
+			WHERE (m.sender_id = c.requester_id AND m.receiver_id = c.receiver_id)
+			   OR (m.sender_id = c.receiver_id AND m.receiver_id = c.requester_id)
+			ORDER BY m.created_at DESC
+			LIMIT 1
+		) lm ON true
+		WHERE c.status = 'accepted' AND (c.requester_id = $1 OR c.receiver_id = $1)
+		ORDER BY COALESCE(lm.created_at, c.created_at) DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := []DMConversationRow{}
+	for rows.Next() {
+		var r DMConversationRow
+		if err := rows.Scan(
+			&r.ConnectionID, &r.OtherUserID, &r.OtherFullName, &r.OtherAvatarUrl,
+			&r.LastMessage, &r.LastMessageAt, &r.LastMessageMine, &r.UnreadCount,
+		); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+type GroupConversationRow struct {
+	ID                uuid.UUID          `json:"id"`
+	Name              string             `json:"name"`
+	Description       *string            `json:"description"`
+	Category          string             `json:"category"`
+	AvatarUrl         *string            `json:"avatar_url"`
+	IsPrivate         bool               `json:"is_private"`
+	MemberRole        string             `json:"member_role"`
+	MemberCount       int64              `json:"member_count"`
+	LastMessage       *string            `json:"last_message"`
+	LastMessageAt     pgtype.Timestamptz `json:"last_message_at"`
+	LastMessageSender *string            `json:"last_message_sender"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ListGroupConversations(ctx context.Context, userID uuid.UUID) ([]GroupConversationRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT
+			g.id, g.name, g.description, g.category, g.avatar_url, g.is_private,
+			gm.role AS member_role,
+			(SELECT COUNT(*) FROM group_members WHERE group_id = g.id) AS member_count,
+			lm.content AS last_message,
+			lm.created_at AS last_message_at,
+			su.full_name AS last_message_sender,
+			g.created_at
+		FROM groups g
+		JOIN group_members gm ON gm.group_id = g.id AND gm.user_id = $1
+		LEFT JOIN LATERAL (
+			SELECT content, created_at, sender_id
+			FROM group_messages
+			WHERE group_id = g.id
+			ORDER BY created_at DESC
+			LIMIT 1
+		) lm ON true
+		LEFT JOIN users su ON su.id = lm.sender_id
+		ORDER BY COALESCE(lm.created_at, g.created_at) DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := []GroupConversationRow{}
+	for rows.Next() {
+		var r GroupConversationRow
+		if err := rows.Scan(
+			&r.ID, &r.Name, &r.Description, &r.Category, &r.AvatarUrl, &r.IsPrivate,
+			&r.MemberRole, &r.MemberCount, &r.LastMessage, &r.LastMessageAt, &r.LastMessageSender,
+			&r.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// ─── Graduation path (500L) ──────────────────────────────────────────────
+// Final-year students don't pay the regular dues cycle; they pay a one-off
+// CRF signing fee (admin-editable) instead, then get their course form
+// signed. Same singleton-price + payment-pipeline pattern as CRF backlog.
+
+// GraduationRequest comes from models.go (generated) — single source of
+// truth for the graduation_requests table row.
+
+const graduationRequestColumns = `id, user_id, amount_charged, payment_id, status, waived, created_by, created_at, paid_at, cleared_by, cleared_at`
+
+func scanGraduationRequest(row pgx.Row) (GraduationRequest, error) {
+	var g GraduationRequest
+	err := row.Scan(
+		&g.ID, &g.UserID, &g.AmountCharged, &g.PaymentID, &g.Status,
+		&g.Waived, &g.CreatedBy, &g.CreatedAt, &g.PaidAt, &g.ClearedBy, &g.ClearedAt,
+	)
+	return g, err
+}
+
+// GraduationFee comes from models.go (generated) — single source of truth
+// for the graduation_fee table row.
+
+func (q *Queries) GetGraduationFee(ctx context.Context) (GraduationFee, error) {
+	row := q.db.QueryRow(ctx, `SELECT amount, updated_by, updated_at FROM graduation_fee WHERE id = 1`)
+	var f GraduationFee
+	err := row.Scan(&f.Amount, &f.UpdatedBy, &f.UpdatedAt)
+	return f, err
+}
+
+func (q *Queries) UpdateGraduationFee(ctx context.Context, amount decimal.Decimal, updatedBy uuid.UUID) (GraduationFee, error) {
+	row := q.db.QueryRow(ctx, `
+		UPDATE graduation_fee
+		SET amount = $1, updated_by = $2, updated_at = NOW()
+		WHERE id = 1
+		RETURNING amount, updated_by, updated_at
+	`, amount, updatedBy)
+	var f GraduationFee
+	err := row.Scan(&f.Amount, &f.UpdatedBy, &f.UpdatedAt)
+	return f, err
+}
+
+
+
+// CreateGraduationRequest inserts the student's graduation request, or
+// returns the existing one unchanged (ON CONFLICT DO NOTHING + re-select)
+// so repeated clicks can't stack duplicate fees. The fee amount is
+// snapshotted so a later admin price change doesn't retroactively change
+// what an existing request owes.
+func (q *Queries) CreateGraduationRequest(ctx context.Context, userID uuid.UUID, amount decimal.Decimal, createdBy uuid.UUID) (GraduationRequest, error) {
+	tag, err := q.db.Exec(ctx, `
+		INSERT INTO graduation_requests (user_id, amount_charged, created_by)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (tenant_id, user_id) DO NOTHING
+	`, userID, amount, createdBy)
+	if err != nil {
+		return GraduationRequest{}, fmt.Errorf("create graduation request: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return q.GetGraduationRequest(ctx, userID)
+	}
+	row := q.db.QueryRow(ctx, `SELECT `+graduationRequestColumns+` FROM graduation_requests WHERE user_id = $1`, userID)
+	return scanGraduationRequest(row)
+}
+
+func (q *Queries) GetGraduationRequest(ctx context.Context, userID uuid.UUID) (GraduationRequest, error) {
+	row := q.db.QueryRow(ctx, `SELECT `+graduationRequestColumns+` FROM graduation_requests WHERE user_id = $1`, userID)
+	return scanGraduationRequest(row)
+}
+
+func (q *Queries) GetGraduationRequestByPaymentID(ctx context.Context, paymentID uuid.UUID) (GraduationRequest, error) {
+	row := q.db.QueryRow(ctx, `SELECT `+graduationRequestColumns+` FROM graduation_requests WHERE payment_id = $1`, paymentID)
+	return scanGraduationRequest(row)
+}
+
+// SetGraduationRequestPayment links the request to the one-off payment the
+// student checks out through. Only a pending_payment request can be linked.
+func (q *Queries) SetGraduationRequestPayment(ctx context.Context, id, paymentID uuid.UUID) (GraduationRequest, error) {
+	row := q.db.QueryRow(ctx, `
+		UPDATE graduation_requests
+		SET payment_id = $2
+		WHERE id = $1 AND status = 'pending_payment'
+		RETURNING `+graduationRequestColumns, id, paymentID)
+	return scanGraduationRequest(row)
+}
+
+// MarkGraduationRequestPaid flips pending_payment -> paid when the linked
+// payment completes through the shared pipeline (webhook or redirect
+// confirmation).
+func (q *Queries) MarkGraduationRequestPaid(ctx context.Context, id uuid.UUID) (GraduationRequest, error) {
+	row := q.db.QueryRow(ctx, `
+		UPDATE graduation_requests
+		SET status = 'paid', paid_at = NOW()
+		WHERE id = $1 AND status = 'pending_payment'
+		RETURNING `+graduationRequestColumns, id)
+	return scanGraduationRequest(row)
+}
+
+// MarkGraduationRequestCleared flips paid -> cleared (or any -> cleared for
+// a waived request, which never has a payment). Cleared is terminal — the
+// student is done with the graduation path.
+func (q *Queries) MarkGraduationRequestCleared(ctx context.Context, id uuid.UUID, clearedBy uuid.UUID) (GraduationRequest, error) {
+	row := q.db.QueryRow(ctx, `
+		UPDATE graduation_requests
+		SET status = 'cleared', cleared_by = $2, cleared_at = NOW()
+		WHERE id = $1 AND (status = 'paid' OR (status = 'pending_payment' AND waived = true))
+		RETURNING `+graduationRequestColumns, id, clearedBy)
+	return scanGraduationRequest(row)
+}
+
+// GetGraduationClearancesForUsers returns the graduation status for a set
+// of user IDs, keyed by user_id — used by batch flows that need to know who
+// is on the graduation path.
+func (q *Queries) GetGraduationClearancesForUsers(ctx context.Context, userIDs []uuid.UUID) ([]GraduationRequest, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT `+graduationRequestColumns+`
+		FROM graduation_requests
+		WHERE user_id = ANY($1)
+	`, userIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []GraduationRequest{}
+	for rows.Next() {
+		g, err := scanGraduationRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// GraduationRequestRow is the staff-facing view of a graduation request —
+// it joins the student's name/matric/level so admin/HOD can see who is on
+// the graduation path without a second lookup.
+type GraduationRequestRow struct {
+	GraduationRequest
+	FullName     string          `json:"full_name"`
+	MatricNumber string          `json:"matric_number"`
+	Level        int32           `json:"level"`
+	Email        string          `json:"email"`
+}
+
+// ListGraduationRequests returns every graduation request, newest first.
+func (q *Queries) ListGraduationRequests(ctx context.Context) ([]GraduationRequestRow, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT `+graduationRequestColumns+`, u.full_name, s.matric_number, s.level, u.email
+		FROM graduation_requests gr
+		JOIN users u ON u.id = gr.user_id
+		JOIN students s ON s.user_id = gr.user_id
+		ORDER BY gr.created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []GraduationRequestRow{}
+	for rows.Next() {
+		var g GraduationRequestRow
+		if err := rows.Scan(
+			&g.ID, &g.UserID, &g.AmountCharged, &g.PaymentID, &g.Status,
+			&g.Waived, &g.CreatedBy, &g.CreatedAt, &g.PaidAt, &g.ClearedBy, &g.ClearedAt,
+			&g.FullName, &g.MatricNumber, &g.Level, &g.Email,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// CreateWaivedGraduationRequest creates a fee-waived graduation request for
+// a student (admin-granted exemption). The dues/signing exemption applies
+// the moment the request exists. Errors if one already exists.
+func (q *Queries) CreateWaivedGraduationRequest(ctx context.Context, userID, createdBy uuid.UUID) (GraduationRequest, error) {
+	row := q.db.QueryRow(ctx, `
+		INSERT INTO graduation_requests (user_id, amount_charged, waived, created_by)
+		VALUES ($1, 0, true, $2)
+		ON CONFLICT (tenant_id, user_id) DO NOTHING
+		RETURNING `+graduationRequestColumns, userID, createdBy)
+	g, err := scanGraduationRequest(row)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return GraduationRequest{}, fmt.Errorf("student already has a graduation request")
+		}
+		return GraduationRequest{}, err
+	}
+	return g, nil
+}

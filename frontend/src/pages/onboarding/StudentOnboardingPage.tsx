@@ -1,0 +1,555 @@
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useForm } from 'react-hook-form';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { z } from 'zod';
+import { useAuth } from '../../hooks/useAuth';
+import { useNotification } from '../../hooks/useNotification';
+import { useDepartments } from '../../hooks/useDepartments';
+import { motion, AnimatePresence } from 'framer-motion';
+import Button from '../../components/ui/Button';
+import Input from '../../components/ui/Input';
+import Card, { CardHeader, CardTitle, CardDescription } from '../../components/ui/Card';
+import {
+  User,
+  Phone,
+  Image,
+  CheckCircle,
+  ArrowRight,
+  ArrowLeft,
+  Calendar,
+  BookOpen,
+  MapPin,
+  AlertCircle,
+} from 'lucide-react';
+import { isValidPhone } from '../../utils/validators';
+import { getErrorDepartment, getErrorMessage, type ErrorDepartment } from '../../utils/errors';
+import apiClient from '../../api/client';
+import { modoolsLoginUrl } from '../../api/modools';
+
+const onboardingSchema = z.object({
+  matricNumber: z
+    .string()
+    .min(1, 'Matric number is required')
+    .regex(/^\d{2}\/[A-Z]{2}\/[A-Z]{2}\/\d{3,5}$/i, 'Use the format 20/EG/XX/1234 (year, faculty, department, serial)'),
+  level: z.string().min(1, 'Level is required'),
+  middleName: z.string().optional(),
+  dateOfBirth: z
+    .string()
+    .min(1, 'Date of birth is required')
+    .refine((val) => {
+      const dob = new Date(val);
+      const age = (Date.now() - dob.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
+      return age >= 16;
+    }, 'You must be at least 16 years old'),
+  admissionMode: z.string().min(1, 'Admission mode is required'),
+  yearAdmitted: z
+    .string()
+    .min(1, 'Year admitted is required')
+    .refine((val) => {
+      const year = parseInt(val);
+      return year >= 1900 && year <= new Date().getFullYear();
+    }, 'Enter a valid year'),
+  phone: z.string().refine(isValidPhone, { message: 'Enter a valid Nigerian phone number' }),
+  profilePhotoUrl: z.string().url('Enter a valid URL').or(z.literal('')),
+  emergencyContact: z.string().min(3, 'Emergency contact name is required'),
+  emergencyContactPhone: z.string().refine(isValidPhone, { message: 'Enter a valid phone number' }),
+  homeAddress: z.string().max(200, 'Address must be 200 characters or less').optional(),
+});
+
+type OnboardingValues = z.infer<typeof onboardingSchema>;
+
+const StudentOnboardingPage = () => {
+  const { updateUser } = useAuth();
+  // The matric format depends on the department the student signed in to. The
+  // server enforces it; this only shows the expected shape.
+  const { departments, selected } = useDepartments();
+  const matricCode = departments.find((d) => d.slug === selected)?.matricCode;
+  const matricExample = matricCode ? `20/${matricCode}/1234` : '20/EG/XX/1234';
+  const { success, error } = useNotification();
+  const navigate = useNavigate();
+  const [step, setStep] = useState(1);
+  const [submitting, setSubmitting] = useState(false);
+  // Set when the matric number belongs to another department. Accounts are kept
+  // per department, so the student finishes setup by signing in to that one.
+  const [otherDepartment, setOtherDepartment] = useState<ErrorDepartment | null>(null);
+  const totalSteps = 4;
+
+  const {
+    register,
+    handleSubmit,
+    trigger,
+    watch,
+    formState: { errors },
+  } = useForm<OnboardingValues>({
+    resolver: zodResolver(onboardingSchema),
+    defaultValues: {
+      admissionMode: 'UTME',
+      yearAdmitted: new Date().getFullYear().toString(),
+    },
+  });
+
+  const watchedValues = watch();
+
+  const stepFields: Record<number, (keyof OnboardingValues)[]> = {
+    1: ['middleName', 'dateOfBirth', 'profilePhotoUrl'],
+    2: ['matricNumber', 'level', 'admissionMode', 'yearAdmitted'],
+    3: ['phone', 'emergencyContact', 'emergencyContactPhone', 'homeAddress'],
+    4: [],
+  };
+
+  const nextStep = async () => {
+    const fields = stepFields[step];
+    if (fields.length > 0) {
+      const valid = await trigger(fields);
+      if (valid) setStep((s) => Math.min(s + 1, totalSteps));
+    } else {
+      setStep((s) => Math.min(s + 1, totalSteps));
+    }
+  };
+
+  const prevStep = () => setStep((s) => Math.max(s - 1, 1));
+
+  const onSubmit = async (data: OnboardingValues) => {
+    setSubmitting(true);
+    try {
+      await apiClient.post('/auth/onboarding', {
+        matric_number: data.matricNumber.toUpperCase(),
+        level: Number(data.level),
+        phone: data.phone,
+        bio: '',
+        avatar: data.profilePhotoUrl || '',
+        middle_name: data.middleName || '',
+        date_of_birth: data.dateOfBirth,
+        admission_mode: data.admissionMode,
+        year_admitted: data.yearAdmitted,
+        emergency_contact: data.emergencyContact,
+        emergency_contact_phone: data.emergencyContactPhone,
+        home_address: data.homeAddress || '',
+        profile_photo_url: data.profilePhotoUrl || '',
+      });
+      updateUser({
+        onboardingCompleted: true,
+        matricNumber: data.matricNumber.toUpperCase(),
+        level: Number(data.level),
+        phone: data.phone,
+        avatar: data.profilePhotoUrl || undefined,
+        middleName: data.middleName || undefined,
+      });
+      success('Profile Set Up Complete', 'Welcome aboard! Your registration is now pending verification.');
+      navigate('/dashboard');
+    } catch (err) {
+      setOtherDepartment(getErrorDepartment(err));
+      error('Could Not Complete Setup', getErrorMessage(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const getAge = (dob: string) => {
+    if (!dob) return '';
+    const age = Math.floor((Date.now() - new Date(dob).getTime()) / (365.25 * 24 * 60 * 60 * 1000));
+    return `${age} years old`;
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-primary-50 via-white to-secondary-50 dark:from-surface-950 dark:via-surface-900 dark:to-surface-950">
+      <Card className="max-w-lg w-full p-8 bg-white dark:bg-surface-900 border border-surface-200 dark:border-surface-800 shadow-xl rounded-2xl">
+        <CardHeader className="flex-col items-center gap-1 text-center mb-6">
+          <div className="w-12 h-12 rounded-full bg-primary-500/10 text-primary-500 flex items-center justify-center mb-2">
+            <User className="w-6 h-6" />
+          </div>
+          <CardTitle className="text-2xl font-bold tracking-tight">Set Up Your Profile</CardTitle>
+          <CardDescription>
+            Step {step} of {totalSteps} — Complete your details
+          </CardDescription>
+
+          {/* Progress bar */}
+          <div className="w-full mt-3">
+            <div className="flex gap-1.5">
+              {Array.from({ length: totalSteps }, (_, i) => (
+                <div
+                  key={i}
+                  className={`h-1.5 flex-1 rounded-full transition-colors duration-300 ${
+                    i < step ? 'bg-primary-500' : 'bg-surface-200 dark:bg-surface-700'
+                  }`}
+                />
+              ))}
+            </div>
+            <div className="flex justify-between mt-1 text-[10px] text-surface-400">
+              <span>Personal</span>
+              <span>Academic</span>
+              <span>Contact</span>
+              <span>Review</span>
+            </div>
+          </div>
+        </CardHeader>
+
+        {otherDepartment && (
+          <div
+            role="alert"
+            className="mb-4 flex flex-col gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/20"
+          >
+            <div className="flex items-start gap-2">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <div className="space-y-1">
+                <p className="text-sm font-semibold text-amber-900 dark:text-amber-100">
+                  This matric number belongs to {otherDepartment.name}.
+                </p>
+                <p className="text-xs text-amber-800 dark:text-amber-200">
+                  Each department keeps its own account. Sign in to {otherDepartment.name} with Modools and finish setup
+                  there, using the same matric number.
+                </p>
+              </div>
+            </div>
+            <Button
+              type="button"
+              className="w-full"
+              onClick={() => {
+                window.location.href = modoolsLoginUrl(otherDepartment.slug);
+              }}
+            >
+              Sign in to {otherDepartment.name}
+            </Button>
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+          <AnimatePresence mode="wait">
+            {/* Step 1: Personal Information */}
+            {step === 1 && (
+              <motion.div
+                key="step1"
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 20 }}
+                className="space-y-4"
+              >
+                <h3 className="text-sm font-semibold text-surface-700 dark:text-surface-300 flex items-center gap-2">
+                  <User className="w-4 h-4" /> Personal Information
+                </h3>
+
+                <Input
+                  label="Middle Name (optional)"
+                  placeholder="e.g. Adebayo"
+                  leftIcon={<User className="w-4 h-4" />}
+                  error={errors.middleName?.message}
+                  {...register('middleName')}
+                />
+
+                <div>
+                  <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1.5">
+                    Date of Birth
+                  </label>
+                  <div className="relative">
+                    <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-surface-400" />
+                    <input
+                      type="date"
+                      className="w-full pl-10 pr-4 py-2.5 text-sm bg-white dark:bg-surface-800 border border-surface-300 dark:border-surface-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 transition-all"
+                      {...register('dateOfBirth')}
+                      max={new Date(new Date().setFullYear(new Date().getFullYear() - 16)).toISOString().split('T')[0]}
+                    />
+                  </div>
+                  {errors.dateOfBirth && <p className="text-xs text-danger-500 mt-1">{errors.dateOfBirth.message}</p>}
+                  {watchedValues.dateOfBirth && (
+                    <p className="text-xs text-surface-400 mt-1">{getAge(watchedValues.dateOfBirth)}</p>
+                  )}
+                </div>
+
+                <Input
+                  label="Profile Photo URL (optional)"
+                  placeholder="https://example.com/photo.jpg"
+                  leftIcon={<Image className="w-4 h-4" />}
+                  error={errors.profilePhotoUrl?.message}
+                  {...register('profilePhotoUrl')}
+                />
+
+                <Button
+                  type="button"
+                  className="w-full mt-4"
+                  onClick={nextStep}
+                  rightIcon={<ArrowRight className="w-4 h-4" />}
+                >
+                  Continue
+                </Button>
+              </motion.div>
+            )}
+
+            {/* Step 2: Academic Information */}
+            {step === 2 && (
+              <motion.div
+                key="step2"
+                initial={{ opacity: 0, x: 20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                className="space-y-4"
+              >
+                <h3 className="text-sm font-semibold text-surface-700 dark:text-surface-300 flex items-center gap-2">
+                  <BookOpen className="w-4 h-4" /> Academic Information
+                </h3>
+
+                <div>
+                  <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-2">
+                    Admission Mode
+                  </label>
+                  <div className="flex gap-4">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        value="UTME"
+                        className="w-4 h-4 text-primary-500 focus:ring-primary-500/20"
+                        {...register('admissionMode')}
+                      />
+                      <span className="text-sm text-surface-700 dark:text-surface-300">UTME</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        value="Direct Entry"
+                        className="w-4 h-4 text-primary-500 focus:ring-primary-500/20"
+                        {...register('admissionMode')}
+                      />
+                      <span className="text-sm text-surface-700 dark:text-surface-300">Direct Entry</span>
+                    </label>
+                  </div>
+                  {errors.admissionMode && (
+                    <p className="text-xs text-danger-500 mt-1">{errors.admissionMode.message}</p>
+                  )}
+                </div>
+
+                <Input
+                  label="Matric Number"
+                  placeholder={matricExample}
+                  hint={matricCode ? `Your department's matric numbers look like ${matricExample}.` : undefined}
+                  leftIcon={<BookOpen className="w-4 h-4" />}
+                  error={errors.matricNumber?.message}
+                  {...register('matricNumber')}
+                />
+
+                <div>
+                  <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-2">Level</label>
+                  <div className="flex gap-2">
+                    {['100', '200', '300', '400', '500'].map((l) => (
+                      <label key={l} className="flex-1 cursor-pointer">
+                        <input type="radio" value={l} className="peer sr-only" {...register('level')} />
+                        <div className="text-center py-2 rounded-lg border text-sm font-medium transition-all peer-checked:border-primary-500 peer-checked:bg-primary-500/10 peer-checked:text-primary-600 dark:peer-checked:text-primary-400 border-surface-200 dark:border-surface-700 text-surface-600 dark:text-surface-400 hover:border-primary-300">
+                          {l}
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                  {errors.level && <p className="text-xs text-danger-500 mt-1">{errors.level.message}</p>}
+                </div>
+
+                <Input
+                  label="Year Admitted"
+                  type="number"
+                  placeholder="e.g. 2024"
+                  leftIcon={<Calendar className="w-4 h-4" />}
+                  error={errors.yearAdmitted?.message}
+                  {...register('yearAdmitted')}
+                />
+
+                <div className="flex gap-4 mt-4">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="flex-1"
+                    onClick={prevStep}
+                    leftIcon={<ArrowLeft className="w-4 h-4" />}
+                  >
+                    Back
+                  </Button>
+                  <Button
+                    type="button"
+                    className="flex-1"
+                    onClick={nextStep}
+                    rightIcon={<ArrowRight className="w-4 h-4" />}
+                  >
+                    Continue
+                  </Button>
+                </div>
+              </motion.div>
+            )}
+
+            {/* Step 3: Contact Information */}
+            {step === 3 && (
+              <motion.div
+                key="step3"
+                initial={{ opacity: 0, x: 20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                className="space-y-4"
+              >
+                <h3 className="text-sm font-semibold text-surface-700 dark:text-surface-300 flex items-center gap-2">
+                  <Phone className="w-4 h-4" /> Contact Information
+                </h3>
+
+                <Input
+                  label="Phone Number"
+                  placeholder="e.g. 08012345678 or +2348012345678"
+                  leftIcon={<Phone className="w-4 h-4" />}
+                  error={errors.phone?.message}
+                  {...register('phone')}
+                />
+
+                <div className="border-t border-surface-200 dark:border-surface-700 pt-4">
+                  <h4 className="text-xs font-semibold text-surface-500 uppercase tracking-wider mb-3">
+                    Emergency Contact
+                  </h4>
+
+                  <Input
+                    label="Contact Name"
+                    placeholder="e.g. Jane Doe"
+                    leftIcon={<User className="w-4 h-4" />}
+                    error={errors.emergencyContact?.message}
+                    {...register('emergencyContact')}
+                  />
+
+                  <div className="mt-3">
+                    <Input
+                      label="Contact Phone"
+                      placeholder="e.g. 08098765432"
+                      leftIcon={<Phone className="w-4 h-4" />}
+                      error={errors.emergencyContactPhone?.message}
+                      {...register('emergencyContactPhone')}
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1.5">
+                    Home Address (optional)
+                  </label>
+                  <div className="relative">
+                    <MapPin className="absolute left-3 top-3 w-4 h-4 text-surface-400" />
+                    <textarea
+                      placeholder="Enter your home address (max 200 chars)"
+                      maxLength={200}
+                      className="w-full pl-10 pr-4 py-2.5 text-sm bg-white dark:bg-surface-800 border border-surface-300 dark:border-surface-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 transition-all resize-none h-20"
+                      {...register('homeAddress')}
+                    />
+                  </div>
+                  {errors.homeAddress && <p className="text-xs text-danger-500 mt-1">{errors.homeAddress.message}</p>}
+                  {watchedValues.homeAddress && (
+                    <p className="text-xs text-surface-400 mt-1 text-right">
+                      {(watchedValues.homeAddress || '').length}/200
+                    </p>
+                  )}
+                </div>
+
+                <div className="flex gap-4 mt-4">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="flex-1"
+                    onClick={prevStep}
+                    leftIcon={<ArrowLeft className="w-4 h-4" />}
+                  >
+                    Back
+                  </Button>
+                  <Button
+                    type="button"
+                    className="flex-1"
+                    onClick={nextStep}
+                    rightIcon={<ArrowRight className="w-4 h-4" />}
+                  >
+                    Review
+                  </Button>
+                </div>
+              </motion.div>
+            )}
+
+            {/* Step 4: Review & Submit */}
+            {step === 4 && (
+              <motion.div
+                key="step4"
+                initial={{ opacity: 0, x: 20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: -20 }}
+                className="space-y-4"
+              >
+                <h3 className="text-sm font-semibold text-surface-700 dark:text-surface-300 flex items-center gap-2">
+                  <CheckCircle className="w-4 h-4" /> Review Your Details
+                </h3>
+
+                <div className="bg-surface-50 dark:bg-surface-800/50 rounded-lg p-4 space-y-3">
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    {watchedValues.middleName && (
+                      <div>
+                        <p className="text-xs text-surface-400 font-medium">Middle Name</p>
+                        <p className="text-surface-900 dark:text-white">{watchedValues.middleName}</p>
+                      </div>
+                    )}
+                    <div>
+                      <p className="text-xs text-surface-400 font-medium">Date of Birth</p>
+                      <p className="text-surface-900 dark:text-white">
+                        {watchedValues.dateOfBirth || '—'}{' '}
+                        {watchedValues.dateOfBirth ? `(${getAge(watchedValues.dateOfBirth)})` : ''}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-surface-400 font-medium">Admission Mode</p>
+                      <p className="text-surface-900 dark:text-white">{watchedValues.admissionMode || '—'}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-surface-400 font-medium">Year Admitted</p>
+                      <p className="text-surface-900 dark:text-white">{watchedValues.yearAdmitted || '—'}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-surface-400 font-medium">Phone</p>
+                      <p className="text-surface-900 dark:text-white">{watchedValues.phone || '—'}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-surface-400 font-medium">Emergency Contact</p>
+                      <p className="text-surface-900 dark:text-white">{watchedValues.emergencyContact || '—'}</p>
+                    </div>
+                    <div className="col-span-2">
+                      <p className="text-xs text-surface-400 font-medium">Emergency Phone</p>
+                      <p className="text-surface-900 dark:text-white">{watchedValues.emergencyContactPhone || '—'}</p>
+                    </div>
+                    {watchedValues.homeAddress && (
+                      <div className="col-span-2">
+                        <p className="text-xs text-surface-400 font-medium">Home Address</p>
+                        <p className="text-surface-900 dark:text-white">{watchedValues.homeAddress}</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-2 bg-primary-50 dark:bg-primary-950/20 rounded-lg p-3">
+                  <AlertCircle className="w-4 h-4 text-primary-500 mt-0.5 shrink-0" />
+                  <p className="text-xs text-primary-700 dark:text-primary-300">
+                    Please verify all details are correct. Some information may require admin approval to change later.
+                  </p>
+                </div>
+
+                <div className="flex gap-4 mt-4">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="flex-1"
+                    onClick={prevStep}
+                    leftIcon={<ArrowLeft className="w-4 h-4" />}
+                  >
+                    Back
+                  </Button>
+                  <Button
+                    type="submit"
+                    className="flex-1"
+                    leftIcon={<CheckCircle className="w-4 h-4" />}
+                    isLoading={submitting}
+                  >
+                    Complete Setup
+                  </Button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </form>
+      </Card>
+    </div>
+  );
+};
+
+export default StudentOnboardingPage;
