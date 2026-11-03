@@ -1,3 +1,7 @@
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+
 /** @type {import('tailwindcss').Config} */
 // Theme for the Tailwind classes. Colours that a department can change (primary) read
 // CSS variables from src/styles/tokens.css; the rest are fixed palettes.
@@ -145,4 +149,4 @@ export default {
       });
     },
   ],
-};
+};																																																																																																																																																																																																																																																																										
